@@ -1,0 +1,1 @@
+API and Telegram Bot /app runtime snapshots were verified byte-for-byte identical at capture time. See ../REVIEW.md.

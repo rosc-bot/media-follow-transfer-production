@@ -1,0 +1,6 @@
+.git
+.env
+data/*.db
+data/*.session
+__pycache__
+.pytest_cache

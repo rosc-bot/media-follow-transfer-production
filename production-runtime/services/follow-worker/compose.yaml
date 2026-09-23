@@ -1,0 +1,92 @@
+name: media-follow-transfer
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      POSTGRES_DB: media_follow_transfer
+      POSTGRES_USER: media_follow_transfer
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U media_follow_transfer -d media_follow_transfer"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - media_follow_transfer_pgdata:/var/lib/postgresql/data
+
+  migrate:
+    build: .
+    env_file: .env
+    environment:
+      TZ: Asia/Shanghai
+    command: alembic upgrade head
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Shanghai
+    command: uvicorn app.api.app:app --host 0.0.0.0 --port 8000
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Shanghai
+    command: python -m app.bot.main
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  follow-worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Shanghai
+    command: python -m app.workers.follow_worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./data:/app/data
+
+  resource-monitor:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Shanghai
+    command: python -m app.workers.resource_monitor_worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./data:/app/data
+
+  transfer-worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Shanghai
+    command: python -m app.workers.transfer_worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./data:/app/data
+
+volumes:
+  media_follow_transfer_pgdata:
