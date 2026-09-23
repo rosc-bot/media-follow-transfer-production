@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 
 from app.core.exceptions import TransferNotAllowed
-from app.follow.completed_root_conflict import CompletedRootConflictScanner
+from app.follow.episode_keys import season_identity
 from app.follow.physical_cloud_inventory import PhysicalCloudInventoryScanner
 from app.follow.promotion import promotion_readback_decision
 from app.transfer.adapters import BaseAdapter
@@ -691,6 +691,10 @@ class GuangyaAdapter(BaseAdapter):
         """
         collected: list[dict] = []
         signatures: set[str] = set()
+        seen_ids: set[str] = set()
+        expected_total: int | None = None
+        expected_pages: int | None = None
+        more_expected = False
         for page in range(100):
             data = await self._authorized_post(
                 client,
@@ -698,22 +702,290 @@ class GuangyaAdapter(BaseAdapter):
                 {'parentId': parent_id, 'page': page, 'pageSize': self.LIST_PAGE_SIZE, **self.LIST_PAGE_PARAMS},
                 ctx,
             )
+            meta = data.get('data') if isinstance(data.get('data'), dict) else {}
+            raw_total = meta.get('total', data.get('total'))
+            if raw_total is not None:
+                try:
+                    page_total = int(raw_total)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError('guangya folder pagination returned invalid total') from exc
+                if page_total < 0 or (expected_total is not None and expected_total != page_total):
+                    raise RuntimeError('guangya folder pagination returned inconsistent total')
+                expected_total = page_total
+            raw_pages = next((meta.get(key, data.get(key)) for key in ('totalPage', 'totalPages', 'pageCount') if meta.get(key, data.get(key)) is not None), None)
+            if raw_pages is not None:
+                try:
+                    page_count = int(raw_pages)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError('guangya folder pagination returned invalid page count') from exc
+                if page_count < 0 or (expected_pages is not None and expected_pages != page_count):
+                    raise RuntimeError('guangya folder pagination returned inconsistent page count')
+                expected_pages = page_count
             items = self._items(data)
             if not items:
+                if expected_total is not None and len(collected) != expected_total:
+                    raise RuntimeError('guangya folder pagination ended before reported total')
+                if more_expected or (expected_pages is not None and page < expected_pages):
+                    raise RuntimeError('guangya folder pagination ended before reported next page')
                 break
             signature = json.dumps(items, ensure_ascii=False, sort_keys=True, separators=(',', ':'), default=str)
             if signature in signatures:
                 raise RuntimeError('guangya folder pagination repeated page; refusing partial listing')
             signatures.add(signature)
+            for item in items:
+                item_id = self._item_id(item)
+                if not item_id:
+                    raise RuntimeError('guangya folder listing returned an item without an ID')
+                if item_id in seen_ids:
+                    raise RuntimeError('guangya folder pagination repeated an item ID')
+                seen_ids.add(item_id)
             collected.extend(items)
-            if not self._has_more(data, page=page, page_size=self.LIST_PAGE_SIZE, item_count=len(items)):
+            if expected_total is not None:
+                if len(collected) > expected_total:
+                    raise RuntimeError('guangya folder pagination exceeded reported total')
+                if len(collected) == expected_total:
+                    break
+                if len(items) < self.LIST_PAGE_SIZE:
+                    raise RuntimeError('SHORT_PAGE_BEFORE_TOTAL')
+                more_expected = True
+                continue
+            explicit_more = next((meta.get(key, data.get(key)) for key in ('hasMore', 'has_more', 'more') if meta.get(key, data.get(key)) is not None), None)
+            if explicit_more is not None:
+                more_expected = str(explicit_more).strip().lower() in {'1', 'true', 'yes'}
+                if more_expected:
+                    continue
                 break
+            more_expected = page + 1 < expected_pages if expected_pages is not None else len(items) >= self.LIST_PAGE_SIZE
+            if more_expected:
+                continue
+            break
+        else:
+            raise RuntimeError('guangya folder pagination exceeded configured safety limit')
         return collected
 
     @staticmethod
     def _tmdb_identity_from_directory_name(name: str) -> int | None:
         match = re.search(r'\{\s*tmdb(?:id)?[-:_= ]*(\d+)\s*\}', str(name or ''), re.IGNORECASE)
         return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _unidentified_title_key(name: str) -> str:
+        value = str(name or '')
+        value = re.sub(r'\{\s*tmdb(?:id)?[-:_= ]*\d+\s*\}', ' ', value, flags=re.IGNORECASE)
+        value = re.sub(r'【完结】', ' ', value)
+        value = re.sub(r'\(\s*\d{4}\s*\)', ' ', value)
+        value = re.sub(r'(?i)(?<![A-Za-z0-9])(?:4k|2160p|1080p|720p|web[- ]?dl|blu[- ]?ray|bluray|remux|hdr|dv)(?![A-Za-z0-9])', ' ', value)
+        value = re.sub(r'(?i)(?:S\s*0*\d+|Season\s*0*\d+|第[0-9一二三四五六七八九十]+季)', ' ', value)
+        return re.sub(r'[^\w]+', '', value, flags=re.UNICODE).casefold()
+
+    async def _find_tmdb_series_roots_readonly(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        root_id: str,
+        root_kind: str,
+        media_root: str,
+        tmdb_id: int,
+        expected_name: str,
+        ctx: GuangyaAuthContext,
+        max_depth: int = 6,
+        max_directories: int = 5000,
+        max_items: int = 50000,
+    ) -> tuple[list[dict], list[dict]]:
+        """Find all direct TMDB roots below one lifecycle root using list-only APIs."""
+        root_id = str(root_id or '').strip()
+        if not root_id:
+            raise RuntimeError('TMDB_ROOT_SCAN_ROOT_ID_MISSING')
+        root_label = '未完结追新' if root_kind == 'ongoing' else '影视转存总目录'
+        pending = [(root_id, [root_label], 0)]
+        visited: set[str] = set()
+        matches: list[dict] = []
+        unidentified: list[dict] = []
+        item_count = 0
+        while pending:
+            parent_id, parent_parts, depth = pending.pop(0)
+            if parent_id in visited:
+                raise RuntimeError('TMDB_ROOT_SCAN_DIRECTORY_CYCLE_OR_ALIAS')
+            visited.add(parent_id)
+            if len(visited) > max_directories:
+                raise RuntimeError('TMDB_ROOT_SCAN_MAX_DIRECTORIES_EXCEEDED')
+            items = await self._list_folder_items(client, parent_id=parent_id, ctx=ctx)
+            for item in items:
+                item_count += 1
+                if item_count > max_items:
+                    raise RuntimeError('TMDB_ROOT_SCAN_MAX_ITEMS_EXCEEDED')
+                if item.get('resType') != 2:
+                    continue
+                folder_id = self._item_id(item)
+                name = str(item.get('name') or item.get('fileName') or '').strip()
+                if not folder_id or not name:
+                    raise RuntimeError('TMDB_ROOT_SCAN_DIRECTORY_ID_OR_NAME_MISSING')
+                path_parts = [*parent_parts, name]
+                identity = self._tmdb_identity_from_directory_name(name)
+                if identity == int(tmdb_id):
+                    matches.append({
+                        'folder_id': folder_id,
+                        'name': name,
+                        'parent_id': parent_id,
+                        'path': '/'.join(path_parts),
+                        'kind': root_kind,
+                    })
+                    if depth >= max_depth:
+                        raise RuntimeError('TMDB_ROOT_SCAN_MAX_DEPTH_EXCEEDED')
+                    # Continue through the matching root's folders so a nested
+                    # duplicate TMDB root cannot be mistaken for one unique root.
+                    pending.append((folder_id, path_parts, depth + 1))
+                    continue
+                if identity is not None:
+                    # A tagged sibling is already a series/movie root; its children
+                    # cannot contain another series root identity for this search.
+                    continue
+                expected_title_key = self._unidentified_title_key(expected_name)
+                if name == expected_name or (
+                    expected_title_key and self._unidentified_title_key(name) == expected_title_key
+                ):
+                    unidentified.append({
+                        'folder_id': folder_id,
+                        'name': name,
+                        'parent_id': parent_id,
+                        'path': '/'.join(path_parts),
+                        'kind': root_kind,
+                    })
+                    continue
+                if parent_id == root_id and name in {'电影', '电视剧'} and media_root and name != media_root:
+                    continue
+                if depth >= max_depth:
+                    raise RuntimeError('TMDB_ROOT_SCAN_MAX_DEPTH_EXCEEDED')
+                pending.append((folder_id, path_parts, depth + 1))
+        return matches, unidentified
+
+    async def _resolve_tmdb_series_root_readonly(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        payload: dict,
+        current_root_id: str,
+        tmdb_id: int,
+        expected_name: str,
+        media_root: str,
+        ctx: GuangyaAuthContext,
+    ) -> dict | None:
+        destination_kind = str(payload.get('destination_kind') or '').casefold()
+        ongoing_id = str(payload.get('ongoing_root_id') or '').strip()
+        completed_id = str(payload.get('completed_root_id') or '').strip()
+        if not ongoing_id and destination_kind == 'ongoing':
+            ongoing_id = str(current_root_id or '').strip()
+        if not completed_id and destination_kind == 'completed':
+            completed_id = str(current_root_id or '').strip()
+        if not ongoing_id or not completed_id or ongoing_id == completed_id:
+            raise FileSelectionError('TMDB_ROOT_SCAN_BOTH_LIFECYCLE_ROOTS_REQUIRED', 'both ongoing and completed root IDs must be configured')
+        roots = [('ongoing', ongoing_id), ('completed', completed_id)]
+        matches: list[dict] = []
+        unidentified: list[dict] = []
+        try:
+            async with asyncio.timeout(90.0):
+                for kind, root_id in roots:
+                    found, unknown = await self._find_tmdb_series_roots_readonly(
+                        client,
+                        root_id=root_id,
+                        root_kind=kind,
+                        media_root=media_root,
+                        tmdb_id=int(tmdb_id),
+                        expected_name=expected_name,
+                        ctx=ctx,
+                    )
+                    matches.extend(found)
+                    unidentified.extend(unknown)
+        except TimeoutError as exc:
+            raise RuntimeError('TMDB_ROOT_SCAN_TIMEOUT') from exc
+        if len(matches) > 1:
+            raise FileSelectionError('DUPLICATE_TMDB_ROOT', f'tmdb_id={int(tmdb_id)} matches={len(matches)}')
+        if unidentified:
+            raise FileSelectionError('SERIES_ROOT_IDENTITY_UNVERIFIED', f'tmdb_id={int(tmdb_id)} has an untagged title-matching root')
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _apply_existing_root_path(payload: dict, root: dict, season_name: str | None) -> None:
+        parts = [part for part in str(root.get('path') or '').split('/') if part]
+        if len(parts) < 2 or parts[-1] != str(root.get('name') or ''):
+            raise RuntimeError('TMDB_ROOT_PATH_READBACK_INVALID')
+        relative_parts = parts[1:-1]
+        root_label = parts[0]
+        actual_series_name = str(root['name']).strip()
+        payload['series_folder_name'] = actual_series_name
+        payload['destination_kind'] = str(root['kind'])
+        root_id_key = 'ongoing_root_id' if root['kind'] == 'ongoing' else 'completed_root_id'
+        payload['target_folder_id'] = str(payload.get(root_id_key) or payload.get('target_folder_id') or '')
+        payload['media_root'] = relative_parts[0] if len(relative_parts) >= 2 else ''
+        payload['media_category'] = relative_parts[1] if len(relative_parts) >= 2 else ''
+        payload['sub_category'] = payload['media_category']
+        item_prefix = '/'.join([*relative_parts, actual_series_name])
+        payload['destination_prefix'] = item_prefix
+        prefix = '/'.join(part for part in (item_prefix, season_name) if part)
+        payload['inventory_prefix'] = prefix
+        payload['remote_rel_path_prefix'] = prefix
+        archive_parts = [root_label, *relative_parts, actual_series_name]
+        if season_name:
+            archive_parts.append(season_name)
+        payload['archive_directory'] = ' / '.join(archive_parts)
+
+    async def _resolve_season_directory(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        series_id: str,
+        season: int,
+        requested_name: str | None,
+        ctx: GuangyaAuthContext,
+        payload: dict,
+        allow_create: bool = True,
+    ) -> str:
+        if int(season) <= 0:
+            raise FileSelectionError('SEASON_IDENTITY_REQUIRED', 'series transfer requires a positive season identity')
+        items = await self._list_folder_items(client, parent_id=series_id, ctx=ctx)
+        directories = [item for item in items if item.get('resType') == 2]
+        parsed = []
+        unknown = []
+        for item in directories:
+            name = str(item.get('name') or item.get('fileName') or '').strip()
+            sid = season_identity(name)
+            if sid is not None:
+                parsed.append((int(sid), item, name))
+            elif re.search(r'(?i)\bS\s*\d+|\bSeason\s*\d+|第.{1,4}季|\d+季', name):
+                unknown.append(name)
+        if unknown:
+            raise FileSelectionError('UNKNOWN_SEASON_FOLDER', f'unrecognized season-like directory names: {sorted(unknown)}')
+        matches = [(item, name) for sid, item, name in parsed if sid == int(season)]
+        if len(matches) > 1:
+            raise FileSelectionError('DUPLICATE_SEASON_ROOT', f'season={int(season)} folder_count={len(matches)}')
+        if matches:
+            folder_id = self._item_id(matches[0][0])
+            if not folder_id:
+                raise FileSelectionError('SEASON_FOLDER_ID_MISSING', 'resolved season directory has no remote folder ID')
+            payload['season_folder_name'] = matches[0][1]
+            return folder_id
+        root_level_videos = [
+            item for item in items
+            if item.get('resType') != 2
+            and is_video_filename(str(item.get('name') or item.get('fileName') or ''))
+        ]
+        if root_level_videos:
+            if not parsed and not requested_name and int(season) == 1:
+                payload.pop('season_folder_name', None)
+                return series_id
+            raise FileSelectionError('MIXED_SINGLE_SEASON_LAYOUT', 'root-level video files conflict with season folders')
+        if not requested_name and not parsed:
+            payload.pop('season_folder_name', None)
+            return series_id
+        if not allow_create:
+            raise RuntimeError(f'PROMOTION_SEASON_FOLDER_MISSING: season={int(season)}')
+        create_name = requested_name or f'S{int(season):02d}'
+        requested_identity = season_identity(create_name)
+        if requested_identity != int(season):
+            raise FileSelectionError('SEASON_IDENTITY_MISMATCH', f'requested folder {create_name!r} does not match season {int(season)}')
+        folder_id = await self._ensure_directory(client, parent_id=series_id, name=create_name, ctx=ctx)
+        payload['season_folder_name'] = create_name
+        return folder_id
 
     async def _ensure_tmdb_series_directory(
         self,
@@ -734,20 +1006,20 @@ class GuangyaAdapter(BaseAdapter):
             ) == int(tmdb_id)
         ]
         if len(matches) > 1:
-            raise RuntimeError(f'DUPLICATE_TMDB_ROOT: tmdb_id={int(tmdb_id)} direct_matches={len(matches)}')
+            raise FileSelectionError('DUPLICATE_TMDB_ROOT', f'tmdb_id={int(tmdb_id)} has {len(matches)} direct child roots')
         if matches:
             item = matches[0]
             folder_id = self._item_id(item)
             actual_name = str(item.get('name') or item.get('fileName') or '').strip()
             if not folder_id or not actual_name:
-                raise RuntimeError(f'SERIES_ROOT_IDENTITY_UNVERIFIED: tmdb_id={int(tmdb_id)}')
+                raise FileSelectionError('SERIES_ROOT_IDENTITY_UNVERIFIED', f'tmdb_id={int(tmdb_id)} matched root has no ID or name')
             return folder_id, actual_name
         exact_unidentified = [
             item for item in directories
             if str(item.get('name') or item.get('fileName') or '').strip() == name
         ]
         if exact_unidentified:
-            raise RuntimeError(f'SERIES_ROOT_IDENTITY_UNVERIFIED: name={name!r} tmdb_id={int(tmdb_id)}')
+            raise FileSelectionError('SERIES_ROOT_IDENTITY_UNVERIFIED', f'title-only root {name!r} has no TMDB tag for tmdb_id={int(tmdb_id)}')
         folder_id = await self._ensure_directory(
             client,
             parent_id=parent_id,
@@ -803,28 +1075,67 @@ class GuangyaAdapter(BaseAdapter):
     ) -> tuple[str, str]:
         """Build root/category/item/season and move promotion roots into that layout."""
         series_name = str(payload.get('series_folder_name') or '').strip()
-        season_name = str(payload.get('season_folder_name') or '').strip()
+        season_name = str(payload.get('season_folder_name') or '').strip() or None
+        operation = str(payload.get('operation') or 'transfer').strip().casefold()
         media_root_name = str(payload.get('media_root') or '').strip()
         media_category_name = str(payload.get('media_category') or payload.get('sub_category') or '').strip()
-        layout_parent_id = root_id
+        promotion_source_id = str(payload.get('promotion_source_series_folder_id') or '').strip()
+        if promotion_source_id and operation != 'promote':
+            raise RuntimeError('PROMOTION_OPERATION_REQUIRED')
+        tmdb_id = int(payload.get('tmdb_id') or 0)
+        media_type = str(payload.get('media_type') or 'tv').casefold()
+        is_series = media_type not in {'movie', 'film', '电影'}
         if bool(media_root_name) != bool(media_category_name):
             raise RuntimeError('canonical destination requires both media_root and media_category')
-        if media_root_name and media_category_name:
-            media_root_id = await self._ensure_directory(
-                client, parent_id=root_id, name=media_root_name, ctx=ctx,
+        root_candidate = None
+        if series_name and is_series:
+            if tmdb_id <= 0:
+                raise FileSelectionError('SERIES_ROOT_IDENTITY_UNVERIFIED', 'positive TMDB ID is required before creating a series root')
+            root_candidate = await self._resolve_tmdb_series_root_readonly(
+                client,
+                payload=payload,
+                current_root_id=root_id,
+                tmdb_id=tmdb_id,
+                expected_name=series_name,
+                media_root=media_root_name,
+                ctx=ctx,
             )
-            layout_parent_id = await self._ensure_directory(
-                client, parent_id=media_root_id, name=media_category_name, ctx=ctx,
-            )
-            payload['destination_media_root_folder_id'] = media_root_id
+            if promotion_source_id and (
+                root_candidate is None
+                or root_candidate.get('kind') != 'ongoing'
+                or str(root_candidate.get('folder_id')) != promotion_source_id
+            ):
+                raise PromotionUnverifiedError(
+                    f'promotion source folder does not match the unique ongoing TMDB root for {tmdb_id}'
+                )
+        actual_series_name = series_name
+        if root_candidate and not promotion_source_id:
+            layout_parent_id = str(root_candidate['parent_id'])
+            series_id = str(root_candidate['folder_id'])
+            actual_series_name = str(root_candidate['name'])
             payload['destination_category_folder_id'] = layout_parent_id
+            payload['destination_kind'] = str(root_candidate['kind'])
+            target_key = 'ongoing_root_id' if root_candidate['kind'] == 'ongoing' else 'completed_root_id'
+            payload['target_folder_id'] = str(payload.get(target_key) or root_id)
+        else:
+            layout_parent_id = root_id
+            if media_root_name and media_category_name:
+                media_root_id = await self._ensure_directory(
+                    client, parent_id=root_id, name=media_root_name, ctx=ctx,
+                )
+                layout_parent_id = await self._ensure_directory(
+                    client, parent_id=media_root_id, name=media_category_name, ctx=ctx,
+                )
+                payload['destination_media_root_folder_id'] = media_root_id
+                payload['destination_category_folder_id'] = layout_parent_id
         if not series_name:
             return layout_parent_id, layout_parent_id
 
-        promotion_source_id = str(payload.get('promotion_source_series_folder_id') or '').strip()
-        tmdb_id = int(payload.get('tmdb_id') or 0)
-        actual_series_name = series_name
         if promotion_source_id:
+            if root_candidate is None:
+                raise PromotionUnverifiedError(
+                    f'promotion source folder does not match the unique ongoing TMDB root for {tmdb_id}'
+                )
             root_items = await self._list_folder_items(client, parent_id=layout_parent_id, ctx=ctx)
             identity_matches = [
                 item for item in root_items
@@ -845,6 +1156,10 @@ class GuangyaAdapter(BaseAdapter):
             if collisions:
                 raise RuntimeError(f'completed destination already contains series directory {series_name!r}')
             if not any(self._item_id(item) == promotion_source_id for item in root_items):
+                payload['promotion_stage'] = 'MOVE_SUBMITTED'
+                payload['promotion_source_parent_id'] = str(root_candidate['parent_id'])
+                payload['promotion_destination_parent_id'] = layout_parent_id
+                payload['promotion_series_folder_id'] = promotion_source_id
                 await self._authorized_post(
                     client,
                     f'{self.api_base}/nd.bizuserres.s/v1/file/move_file',
@@ -855,22 +1170,18 @@ class GuangyaAdapter(BaseAdapter):
             moved = [item for item in root_items if self._item_id(item) == promotion_source_id and item.get('resType') == 2]
             if len(moved) != 1:
                 raise RuntimeError('could not verify moved ongoing series directory in completed category')
-            current_name = str(moved[0].get('name') or moved[0].get('fileName') or '')
-            if current_name != series_name:
-                await self._authorized_post(
-                    client,
-                    f'{self.api_base}/nd.bizuserres.s/v1/file/rename',
-                    {'fileId': promotion_source_id, 'newName': series_name},
-                    ctx,
-                )
-                root_items = await self._list_folder_items(client, parent_id=layout_parent_id, ctx=ctx)
-                renamed = [
-                    item for item in root_items
-                    if self._item_id(item) == promotion_source_id
-                    and str(item.get('name') or item.get('fileName') or '') == series_name
-                ]
-                if len(renamed) != 1:
-                    raise RuntimeError('could not verify completed series directory rename')
+            payload['promotion_source_parent_id'] = str(root_candidate['parent_id'])
+            payload['promotion_destination_parent_id'] = layout_parent_id
+            payload['promotion_original_series_name'] = str(moved[0].get('name') or moved[0].get('fileName') or '')
+            await self._verify_promotion_parent_readback(
+                client,
+                series_id=promotion_source_id,
+                source_parent_id=str(root_candidate['parent_id']),
+                destination_parent_id=layout_parent_id,
+                ctx=ctx,
+            )
+            payload['promotion_stage'] = 'MOVED'
+            payload['promotion_series_folder_id'] = promotion_source_id
             series_id = promotion_source_id
         elif tmdb_id > 0 and str(payload.get('media_type') or 'tv').casefold() not in {'movie', 'film', '电影'}:
             series_id, actual_series_name = await self._ensure_tmdb_series_directory(
@@ -883,7 +1194,7 @@ class GuangyaAdapter(BaseAdapter):
         else:
             series_id = await self._ensure_directory(client, parent_id=layout_parent_id, name=series_name, ctx=ctx)
 
-        if actual_series_name != series_name:
+        if actual_series_name != series_name and not root_candidate:
             payload['series_folder_name'] = actual_series_name
             canonical_base = '/'.join(
                 part for part in (media_root_name, media_category_name, actual_series_name) if part
@@ -898,9 +1209,23 @@ class GuangyaAdapter(BaseAdapter):
                 archive_parts.append(season_name)
             payload['archive_directory'] = ' / '.join(part for part in archive_parts if part)
 
-        if not season_name:
-            return series_id, series_id
-        season_id = await self._ensure_directory(client, parent_id=series_id, name=season_name, ctx=ctx)
+        season_id = series_id
+        if is_series:
+            try:
+                season_number = int(payload.get('season') or season_identity(season_name) or 1)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError('SEASON_IDENTITY_REQUIRED') from exc
+            season_id = await self._resolve_season_directory(
+                client,
+                series_id=series_id,
+                season=season_number,
+                requested_name=None if operation == 'promote' else season_name,
+                ctx=ctx,
+                payload=payload,
+                allow_create=operation != 'promote',
+            )
+        if root_candidate and not promotion_source_id:
+            self._apply_existing_root_path(payload, root_candidate, payload.get('season_folder_name'))
         return series_id, season_id
 
     async def refresh_access_token(self, client: httpx.AsyncClient, refresh_token: str) -> str | None:
@@ -1100,6 +1425,59 @@ class GuangyaAdapter(BaseAdapter):
                     files.append(item_copy)
         return files
 
+    @staticmethod
+    def _completed_folder_name(name: str) -> str:
+        base = re.sub(r'(?:\s*【完结】)+\s*$', '', str(name or '')).strip()
+        if not base:
+            raise PromotionUnverifiedError('verified promotion title is missing')
+        return f'{base}【完结】'
+
+    @staticmethod
+    def _replace_path_component(value: object, old_name: str, new_name: str) -> str:
+        parts = [part for part in str(value or '').strip('/').split('/') if part]
+        indices = [index for index, part in enumerate(parts) if part == old_name]
+        if indices:
+            parts[indices[-1]] = new_name
+        return '/'.join(parts)
+
+    async def _verify_promotion_parent_readback(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        series_id: str,
+        source_parent_id: str,
+        destination_parent_id: str,
+        ctx: GuangyaAuthContext,
+    ) -> str:
+        source_parent_id = str(source_parent_id or '').strip()
+        destination_parent_id = str(destination_parent_id or '').strip()
+        if not source_parent_id or not destination_parent_id or source_parent_id == destination_parent_id:
+            raise PromotionUnverifiedError(
+                'promotion source/destination parent fence is missing or ambiguous',
+                series_folder_id=series_id,
+            )
+        destination_items = await self._list_folder_items(
+            client, parent_id=destination_parent_id, ctx=ctx,
+        )
+        destination_matches = [
+            item for item in destination_items
+            if item.get('resType') == 2 and self._item_id(item) == series_id
+        ]
+        source_items = await self._list_folder_items(
+            client, parent_id=source_parent_id, ctx=ctx,
+        )
+        source_matches = [
+            item for item in source_items
+            if item.get('resType') == 2 and self._item_id(item) == series_id
+        ]
+        if len(destination_matches) != 1 or source_matches:
+            raise PromotionUnverifiedError(
+                'promotion folder-id parent readback is not unique or source still exists',
+                series_folder_id=series_id,
+                remote_records=destination_matches + source_matches,
+            )
+        return str(destination_matches[0].get('name') or destination_matches[0].get('fileName') or '').strip()
+
     async def _verify_promotion_readback(
         self,
         client: httpx.AsyncClient,
@@ -1132,27 +1510,38 @@ class GuangyaAdapter(BaseAdapter):
         observed: dict[str, list[str]] = {}
         for item in records:
             path = str(item.get('_relative_path') or '')
-            season_match = re.search(r'(?i)(S\d{2}|Season\s*\d+|第\d+季)', path)
-            if season_match:
-                token = season_match.group(1)
-                if token.casefold().startswith('season') or token.startswith('第'):
-                    number_match = re.search(r'\d+', token)
-                    season_key = f"S{int(number_match.group()):02d}" if number_match else 'S01'
-                else:
-                    season_key = token.upper()
-            else:
-                season_key = str(payload.get('season_folder_name') or 'S01')
-            observed.setdefault(season_key, []).append(
-                str(item.get('name') or item.get('fileName') or '').strip()
+            path_seasons = {
+                sid for part in path.split('/')[:-1]
+                if (sid := season_identity(part)) is not None
+            }
+            file_name = str(item.get('name') or item.get('fileName') or '').strip()
+            file_match = re.search(r'(?i)S(\d{1,3})E\d{1,4}', file_name)
+            file_season = int(file_match.group(1)) if file_match else None
+            if len(path_seasons) > 1 or (path_seasons and file_season and file_season not in path_seasons):
+                raise PromotionUnverifiedError(
+                    'promotion readback contains conflicting season identities',
+                    series_folder_id=series_id,
+                    remote_records=records,
+                )
+            season_number = next(iter(path_seasons), None) or file_season
+            if season_number is None:
+                season_number = season_identity(str(payload.get('season_folder_name') or '')) or 1
+            season_key = f'S{int(season_number):02d}'
+            observed.setdefault(season_key, []).append(file_name)
+        source_parent_id = str(
+            payload.get('promotion_source_parent_id') or payload.get('ongoing_root_id') or ''
+        ).strip()
+        if not source_parent_id:
+            raise PromotionUnverifiedError(
+                'promotion source parent ID is missing',
+                series_folder_id=series_id,
             )
         source_root_items = await self._list_folder_items(
             client,
-            parent_id=str(payload.get('ongoing_root_id') or '').strip(),
+            parent_id=source_parent_id,
             ctx=ctx,
-        ) if str(payload.get('ongoing_root_id') or '').strip() else []
-        source_exists = not str(payload.get('ongoing_root_id') or '').strip() or any(
-            self._item_id(item) == source_series_id for item in source_root_items
         )
+        source_exists = any(self._item_id(item) == source_series_id for item in source_root_items)
         decision = promotion_readback_decision(
             move_returned=True,
             expected_files_by_season=expected,
@@ -1224,42 +1613,56 @@ class GuangyaAdapter(BaseAdapter):
         completed_root_id: str,
         tmdb_id: int,
         title: str,
+        media_root: str = '电视剧',
+        expected_series_name: str | None = None,
+        ongoing_root_id: str | None = None,
         page_size: int = 100,
     ) -> dict:
-        """Inspect only direct completed-root children; never recurse or write."""
+        """Recursively search only directory roots for this TMDB ID; never write."""
+        del page_size  # directory listings use the provider's verified page size
         ctx = context_from_auth_ref(str(auth_token or '').strip())
         if not ctx.access_token:
             return {'status': 'UNVERIFIED', 'conflict': True, 'error': 'READ_ONLY_SCAN_REQUIRES_ACCESS_TOKEN'}
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-                items: list[dict] = []
-                for page in range(100):
-                    data = await self.post(
-                        client,
-                        f'{self.api_base}/nd.bizuserres.s/v1/file/get_file_list',
-                        {
-                            'parentId': str(completed_root_id),
-                            'page': page,
-                            'pageSize': page_size,
-                            **self.LIST_PAGE_PARAMS,
-                        },
-                        self.credential_provider._api_headers(ctx.access_token),
-                    )
-                    page_items = self._items(data)
-                    if not page_items:
-                        break
-                    items.extend(page_items)
-                    if not self._has_more(data, page=page, page_size=page_size, item_count=len(page_items)):
-                        break
-                else:
-                    return {'status': 'UNVERIFIED', 'conflict': True, 'error': 'DIRECT_CHILD_PAGINATION_LIMIT'}
-            return CompletedRootConflictScanner.inspect_direct_children(
-                items,
-                tmdb_id=int(tmdb_id),
-                title=title,
-            )
-        except Exception as exc:  # noqa: BLE001 - fail closed for promotion
-            return {'status': 'UNVERIFIED', 'conflict': True, 'error': type(exc).__name__}
+                try:
+                    async with asyncio.timeout(90.0):
+                        candidates = []
+                        unidentified = []
+                        roots_to_scan = []
+                        if ongoing_root_id:
+                            roots_to_scan.append(('ongoing', str(ongoing_root_id).strip()))
+                        roots_to_scan.append(('completed', str(completed_root_id).strip()))
+                        if not all(root_id for _kind, root_id in roots_to_scan) or len({root_id for _kind, root_id in roots_to_scan}) != len(roots_to_scan):
+                            return {'status': 'UNVERIFIED', 'conflict': True, 'error': 'LIFECYCLE_ROOT_CONFIGURATION_INVALID', 'series_roots': []}
+                        for root_kind, root_id in roots_to_scan:
+                            roots, unknown = await self._find_tmdb_series_roots_readonly(
+                                client,
+                                root_id=root_id,
+                                root_kind=root_kind,
+                                media_root=str(media_root or '电视剧'),
+                                tmdb_id=int(tmdb_id),
+                                expected_name=str(expected_series_name or title or '').strip(),
+                                ctx=ctx,
+                            )
+                            candidates.extend(roots)
+                            unidentified.extend(unknown)
+                except TimeoutError:
+                    return {'status': 'UNVERIFIED', 'conflict': True, 'error': 'COMPLETED_ROOT_SCAN_TIMEOUT'}
+            if unidentified:
+                return {'status': 'UNVERIFIED', 'conflict': True, 'error': 'SERIES_ROOT_IDENTITY_UNVERIFIED', 'series_roots': []}
+            if len(candidates) > 1:
+                return {'status': 'DUPLICATE_TMDB_ROOT', 'conflict': True, 'error': 'DUPLICATE_TMDB_ROOT', 'series_roots': candidates}
+            completed_matches = [root for root in candidates if root.get('kind') == 'completed']
+            return {
+                'status': 'VERIFIED',
+                'conflict': bool(completed_matches),
+                'matched_direct_children': completed_matches,
+                'series_roots': candidates,
+                'recursive_scan': True,
+            }
+        except Exception as exc:  # noqa: BLE001 - provider/read scan errors fail closed
+            return {'status': 'UNVERIFIED', 'conflict': True, 'error': type(exc).__name__, 'series_roots': []}
 
     async def transfer(self, payload: dict) -> TransferOutcome:
         if not self.write_enabled:
@@ -1382,11 +1785,15 @@ class GuangyaAdapter(BaseAdapter):
                 if not source_series_id:
                     raise PromotionUnverifiedError('promotion source series folder ID is required')
                 promotion_stage = str(payload.get('promotion_stage') or '').upper()
-                if promotion_stage == 'MOVED':
+                if promotion_stage in {'MOVE_SUBMITTED', 'MOVED'}:
+                    # Once a move request may have reached Guangya, retries are
+                    # strictly readback/rename-only and never resubmit move_file.
                     series_id = str(payload.get('promotion_series_folder_id') or '').strip()
-                    season_id = str(payload.get('promotion_season_folder_id') or '').strip()
+                    season_id = str(payload.get('promotion_season_folder_id') or '').strip() or series_id
                     if not series_id:
                         raise PromotionUnverifiedError('promotion readback fence has no series folder ID')
+                    if not payload.get('promotion_source_parent_id') or not payload.get('promotion_destination_parent_id'):
+                        raise PromotionUnverifiedError('promotion readback fence has no verified source/destination parents')
                 else:
                     series_id, season_id = await self._prepare_destination_layout(
                         client,
@@ -1406,27 +1813,133 @@ class GuangyaAdapter(BaseAdapter):
                         ctx=ctx,
                         payload=payload,
                     )
-                except PromotionUnverifiedError:
+                    destination_parent_id = str(payload.get('promotion_destination_parent_id') or '').strip()
+                    source_parent_id = str(payload.get('promotion_source_parent_id') or '').strip()
+                    current_root_name = await self._verify_promotion_parent_readback(
+                        client,
+                        series_id=series_id,
+                        source_parent_id=source_parent_id,
+                        destination_parent_id=destination_parent_id,
+                        ctx=ctx,
+                    )
+                    tmdb_id = int(payload.get('tmdb_id') or 0)
+                    if tmdb_id <= 0:
+                        raise PromotionUnverifiedError('promotion TMDB identity is missing', series_folder_id=series_id)
+                    series_base_name = str(payload.get('series_folder_name') or current_root_name).strip()
+                    desired_name = self._completed_folder_name(series_base_name)
+                    identity_readback = await self._resolve_tmdb_series_root_readonly(
+                        client,
+                        payload=payload,
+                        current_root_id=str(payload.get('completed_root_id') or target_id),
+                        tmdb_id=tmdb_id,
+                        expected_name=series_base_name,
+                        media_root=str(payload.get('media_root') or ''),
+                        ctx=ctx,
+                    )
+                    if (
+                        identity_readback is None
+                        or str(identity_readback.get('folder_id')) != series_id
+                        or identity_readback.get('kind') != 'completed'
+                    ):
+                        raise PromotionUnverifiedError(
+                            'promotion TMDB root identity is not unique in completed storage',
+                            series_folder_id=series_id,
+                        )
+                    if current_root_name != desired_name:
+                        await self._authorized_post(
+                            client,
+                            f'{self.api_base}/nd.bizuserres.s/v1/file/rename',
+                            {'fileId': series_id, 'newName': desired_name},
+                            ctx,
+                        )
+                    final_name = await self._verify_promotion_parent_readback(
+                        client,
+                        series_id=series_id,
+                        source_parent_id=source_parent_id,
+                        destination_parent_id=destination_parent_id,
+                        ctx=ctx,
+                    )
+                    if final_name != desired_name:
+                        raise PromotionUnverifiedError(
+                            'completed marker rename readback did not match the required name',
+                            series_folder_id=series_id,
+                        )
+                    final_identity = await self._resolve_tmdb_series_root_readonly(
+                        client,
+                        payload=payload,
+                        current_root_id=str(payload.get('completed_root_id') or target_id),
+                        tmdb_id=tmdb_id,
+                        expected_name=series_base_name,
+                        media_root=str(payload.get('media_root') or ''),
+                        ctx=ctx,
+                    )
+                    if (
+                        final_identity is None
+                        or str(final_identity.get('folder_id')) != series_id
+                        or final_identity.get('kind') != 'completed'
+                    ):
+                        raise PromotionUnverifiedError(
+                            'completed folder ID is not unique after marker rename',
+                            series_folder_id=series_id,
+                        )
+                except PromotionUnverifiedError as exc:
                     payload['promotion_stage'] = 'MOVED'
                     payload['promotion_series_folder_id'] = series_id
                     payload['promotion_season_folder_id'] = season_id
+                    payload['promotion_status'] = 'PROMOTION_UNVERIFIED'
                     payload['promotion_readback'] = {
                         'status': 'PROMOTION_UNVERIFIED',
+                        'error_type': type(exc).__name__,
                         'observed_by_season': observed_by_season if 'observed_by_season' in locals() else {},
                     }
                     raise
+                except Exception as exc:
+                    payload['promotion_stage'] = 'MOVED'
+                    payload['promotion_series_folder_id'] = series_id
+                    payload['promotion_season_folder_id'] = season_id
+                    payload['promotion_status'] = 'PROMOTION_UNVERIFIED'
+                    payload['promotion_readback'] = {
+                        'status': 'PROMOTION_UNVERIFIED',
+                        'error_type': type(exc).__name__,
+                        'observed_by_season': observed_by_season if 'observed_by_season' in locals() else {},
+                    }
+                    raise PromotionUnverifiedError(
+                        f'promotion readback/marker verification failed: {type(exc).__name__}',
+                        series_folder_id=series_id,
+                    ) from exc
+                payload['series_folder_name'] = desired_name
+                item_prefix = '/'.join(
+                    part for part in (
+                        str(payload.get('media_root') or '').strip('/'),
+                        str(payload.get('media_category') or payload.get('sub_category') or '').strip('/'),
+                        desired_name,
+                    ) if part
+                )
+                season_name = str(payload.get('season_folder_name') or '').strip()
+                payload['destination_kind'] = 'completed'
+                payload['destination_prefix'] = item_prefix
+                payload['inventory_prefix'] = '/'.join(part for part in (item_prefix, season_name) if part)
+                payload['remote_rel_path_prefix'] = payload['inventory_prefix']
+                archive_parts = [
+                    '影视转存总目录',
+                    str(payload.get('media_root') or '').strip('/'),
+                    str(payload.get('media_category') or payload.get('sub_category') or '').strip('/'),
+                    desired_name,
+                ]
+                if season_name:
+                    archive_parts.append(season_name)
+                payload['archive_directory'] = ' / '.join(part for part in archive_parts if part)
                 payload['promotion_status'] = 'PROMOTION_COMPLETED'
+                payload['promotion_marker_status'] = 'COMPLETION_MARKER_VERIFIED'
                 payload['promotion_readback'] = {
                     'status': 'PROMOTION_COMPLETED',
+                    'folder_id': series_id,
+                    'folder_name': desired_name,
+                    'folder_id_unique': True,
+                    'ongoing_source_absent': True,
+                    'marker_verified': True,
                     'observed_by_season': observed_by_season,
                 }
-                payload['remote_rel_path_prefix'] = str(
-                    payload.get('inventory_prefix')
-                    or payload.get('remote_rel_path_prefix')
-                    or payload.get('destination_prefix')
-                    or payload.get('series_folder_name')
-                    or ''
-                ).strip()
                 return TransferOutcome(
                     True,
                     True,

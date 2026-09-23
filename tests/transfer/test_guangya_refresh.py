@@ -22,7 +22,7 @@ class RefreshingGuangyaAdapter(GuangyaAdapter):
             self.restore_headers = headers
             return {'code': 0, 'data': {}}
         if url.endswith('/file/get_file_list'):
-            return {'code': 0, 'data': {'list': [{'name': 'episode.mkv', 'resType': 1}], 'hasMore': False}}
+            return {'code': 0, 'data': {'list': [{'fileId': 'target-episode', 'name': 'episode.mkv', 'resType': 1}], 'hasMore': False}}
         raise AssertionError(url)
 
 

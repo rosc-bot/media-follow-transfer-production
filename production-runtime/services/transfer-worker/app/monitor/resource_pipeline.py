@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
@@ -27,11 +28,14 @@ CREATE TABLE IF NOT EXISTS messages (
     chat_id TEXT NOT NULL,
     chat_title TEXT,
     message_id INTEGER NOT NULL,
-    text TEXT NOT NULL,
+    text TEXT NOT NULL DEFAULT '',
+    caption TEXT NOT NULL DEFAULT '',
     urls TEXT NOT NULL DEFAULT '[]',
     source_type TEXT NOT NULL,
     is_forward INTEGER NOT NULL DEFAULT 0,
     date TEXT,
+    content_hash TEXT,
+    updated_at TEXT,
     UNIQUE(chat_id, message_id)
 );
 CREATE TABLE IF NOT EXISTS resource_outbox (
@@ -65,34 +69,116 @@ class ResourceStorage:
     def init_db(self) -> None:
         with self.get_conn() as conn:
             conn.executescript(RESOURCE_SCHEMA)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+            migrations = (
+                ("caption", "ALTER TABLE messages ADD COLUMN caption TEXT NOT NULL DEFAULT ''"),
+                ("content_hash", "ALTER TABLE messages ADD COLUMN content_hash TEXT"),
+                ("updated_at", "ALTER TABLE messages ADD COLUMN updated_at TEXT"),
+            )
+            for name, statement in migrations:
+                if name not in columns:
+                    conn.execute(statement)
+                    columns.add(name)
+            legacy_rows = conn.execute(
+                """SELECT id, text, caption, urls, source_type, is_forward, date, updated_at
+                   FROM messages WHERE content_hash IS NULL"""
+            ).fetchall()
+            for row in legacy_rows:
+                try:
+                    stored_urls = json.loads(row["urls"] or "[]")
+                    if not isinstance(stored_urls, list):
+                        stored_urls = [str(row["urls"] or "")]
+                except json.JSONDecodeError:
+                    stored_urls = [str(row["urls"] or "")]
+                payload = {
+                    "text": row["text"] or "",
+                    "caption": row["caption"] or "",
+                    "urls": stored_urls,
+                    "source_type": row["source_type"],
+                    "is_forward": bool(row["is_forward"]),
+                }
+                conn.execute(
+                    "UPDATE messages SET content_hash=?, updated_at=COALESCE(updated_at,date,?) WHERE id=? AND content_hash IS NULL",
+                    (self._content_hash(payload), datetime.now(UTC).isoformat(), row["id"]),
+                )
+    @staticmethod
+    def _content_hash(payload: dict) -> str:
+        content = {
+            "text": str(payload.get("text") or ""),
+            "caption": str(payload.get("caption") or ""),
+            "urls": list(payload.get("urls") or []),
+            "button_urls": list(payload.get("button_urls") or []),
+            "entities": list(payload.get("entities") or []),
+            "source_type": str(payload.get("source_type") or SOURCE_TELEGRAM_CHANNEL),
+            "is_forward": bool(payload.get("is_forward")),
+        }
+        encoded = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def save_and_enqueue(self, payload: dict) -> bool:
+        """Upsert an original or edited post and enqueue only changed content."""
+        chat_id = str(payload["channel_id"])
+        message_id = int(payload["message_id"])
+        content_hash = self._content_hash(payload)
+        updated_at = datetime.now(UTC).isoformat()
+        message_metadata = dict(payload.get("metadata") or {})
+        message_metadata["resource_content_hash"] = content_hash
+        changed_payload = {**payload, "metadata": message_metadata}
+        text = str(payload.get("text") or "")
+        caption = str(payload.get("caption") or "")
+        raw_urls = json.dumps(payload.get("urls") or [], ensure_ascii=False)
+
         with self.get_conn() as conn:
+            existing = conn.execute(
+                "SELECT content_hash FROM messages WHERE chat_id=? AND message_id=?",
+                (chat_id, message_id),
+            ).fetchone()
+            content_changed = existing is None or existing["content_hash"] != content_hash
             conn.execute(
-                """INSERT OR IGNORE INTO messages(chat_id, chat_title, message_id, text, urls, source_type, is_forward, date)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO messages(
+                       chat_id, chat_title, message_id, text, caption, urls, source_type,
+                       is_forward, date, content_hash, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                       chat_title=excluded.chat_title,
+                       text=excluded.text,
+                       caption=excluded.caption,
+                       urls=excluded.urls,
+                       source_type=excluded.source_type,
+                       is_forward=excluded.is_forward,
+                       date=excluded.date,
+                       content_hash=excluded.content_hash,
+                       updated_at=excluded.updated_at""",
                 (
-                    payload["channel_id"],
+                    chat_id,
                     payload.get("channel_title"),
-                    payload["message_id"],
-                    payload.get("text") or payload.get("caption") or "",
-                    json.dumps(payload.get("urls") or [], ensure_ascii=False),
+                    message_id,
+                    text,
+                    caption,
+                    raw_urls,
                     payload.get("source_type", SOURCE_TELEGRAM_CHANNEL),
                     int(bool(payload.get("is_forward"))),
                     payload.get("published_at"),
+                    content_hash,
+                    updated_at,
                 ),
             )
-            cur = conn.execute(
-                """INSERT OR IGNORE INTO resource_outbox(channel_id, message_id, payload, status, created_at)
-                   VALUES (?, ?, ?, 'PENDING', ?)""",
-                (
-                    payload["channel_id"],
-                    payload["message_id"],
-                    json.dumps(payload, ensure_ascii=False),
-                    datetime.now(UTC).isoformat(),
-                ),
+            if not content_changed:
+                return False
+            conn.execute(
+                """INSERT INTO resource_outbox(channel_id, message_id, payload, status, created_at)
+                   VALUES (?, ?, ?, 'PENDING', ?)
+                   ON CONFLICT(channel_id, message_id) DO UPDATE SET
+                       payload=excluded.payload,
+                       status='PENDING',
+                       attempt_count=0,
+                       next_retry_at=NULL,
+                       last_error=NULL,
+                       created_at=excluded.created_at,
+                       sent_at=NULL""",
+                (chat_id, message_id, json.dumps(changed_payload, ensure_ascii=False), updated_at),
             )
-            return cur.rowcount == 1
+            return True
 
     def get_pending(self, limit: int = 50) -> list[dict]:
         with self.get_conn() as conn:

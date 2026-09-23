@@ -1,4 +1,6 @@
 
+from datetime import UTC, datetime
+
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,7 +23,7 @@ from app.ingest.resource_link_extractor import ResourceLinkExtractor
 from app.ingest.url_extractor import extract_urls
 from app.models.ingest import ChannelIngestJob, ChannelIngestMessage
 from app.models.resource import Resource
-from app.models.transfer import TransferQueueTask
+from app.models.transfer import TransferJob, TransferQueueTask
 from app.models.watchlist import SeriesWatchlist
 from app.schemas.telegram_source import TelegramSourceMessage
 from app.transfer.normalization import share_hash
@@ -45,6 +47,85 @@ class ChannelIngestService:
         return next(iter(ids)) if len(ids) == 1 else None
 
     @staticmethod
+    async def _reactivate_pending_task_with_new_evidence(
+        db: AsyncSession,
+        *,
+        resource: Resource,
+        episode_keys: list[str],
+        share_url: str,
+        source_msg: TelegramSourceMessage,
+    ) -> TransferQueueTask | None:
+        """Requeue one unfenced review task only after exact new source evidence."""
+        if resource.status != 'READY' or resource.transferred_folder_id:
+            return None
+        if not resource.tmdb_id or not resource.season or not resource.share_url:
+            return None
+        if share_hash(str(resource.share_url)) != share_hash(str(share_url or '')):
+            return None
+        season = int(resource.season)
+        target_keys = set(canonical_episode_keys(episode_keys, season=season))
+        if not target_keys:
+            return None
+        active_transfer = await db.scalar(select(TransferJob.id).where(
+            TransferJob.resource_id == resource.id,
+            TransferJob.status == 'RUNNING',
+        ).limit(1))
+        if active_transfer is not None:
+            return None
+        rows = list((await db.scalars(select(TransferQueueTask).where(
+            TransferQueueTask.resource_id == resource.id,
+            TransferQueueTask.status == REVIEW_STATUS,
+        ).order_by(TransferQueueTask.id.asc()))).all())
+        matching = []
+        for task in rows:
+            payload = dict(task.payload or {})
+            task_keys = set(canonical_episode_keys(
+                payload.get('episode_keys') or ([resource.episode_key] if resource.episode_key else []),
+                season=season,
+            ))
+            if not target_keys.issubset(task_keys):
+                continue
+            if str(payload.get('operation') or '').casefold() == 'promote':
+                continue
+            fenced_stage = str(payload.get('execution_stage') or '').upper()
+            if fenced_stage in {'RESTORE_SUBMITTED', 'RESTORED', 'RESTORE_VERIFIED', 'RENAMING', 'RENAME_VERIFIED'}:
+                continue
+            if any(payload.get(key) for key in ('remote_submission_id', 'restore_task_id', 'restore_submitted_at')):
+                continue
+            matching.append(task)
+        if len(matching) != 1:
+            return None
+        task = matching[0]
+        updated = dict(task.payload or {})
+        for key in (
+            'preflight_classification', 'preflight_reason', 'preflight_runtime_verified_at',
+            'preflight_rename_status', 'selection_snapshot', 'hydrated_selection',
+            'selected_file_ids', 'selected_file_names', 'selected_episode_keys',
+            'selected_episode_by_file_id', 'batch_presence_preflight',
+        ):
+            updated.pop(key, None)
+        updated.update({
+            'provider': str(resource.cloud_name or provider_from_url(share_url) or 'guangya'),
+            'resource_id': int(resource.id),
+            'tmdb_id': int(resource.tmdb_id),
+            'title': str(resource.title or source_msg.metadata.get('title') or ''),
+            'season': season,
+            'episode_keys': sorted(target_keys),
+            'share_url': str(resource.share_url),
+            'source_channel_id': str(source_msg.channel_id),
+            'source_message_id': int(source_msg.message_id),
+            'new_evidence_message_id': int(source_msg.message_id),
+        })
+        task.payload = updated
+        task.status = 'QUEUED'
+        task.error_message = None
+        task.next_run_at = datetime.now(UTC)
+        task.locked_at = None
+        task.locked_by = None
+        await db.flush()
+        return task
+
+    @staticmethod
     async def process_source_message(db: AsyncSession, source_msg: TelegramSourceMessage, *, channel_setting: object | None = None) -> dict:
         source_type = source_msg.source_type.strip().lower()
         if source_type not in SOURCE_TYPES:
@@ -56,7 +137,15 @@ class ChannelIngestService:
                 ChannelIngestJob.message_id == source_msg.message_id,
             )
         )
+        new_evidence = existing is None
         if existing:
+            existing_parsed = dict(existing.parsed_data or {})
+            incoming_hash = str(source_msg.metadata.get('resource_content_hash') or '').strip()
+            previous_hash = str(existing_parsed.get('resource_content_hash') or '').strip()
+            incoming_tmdb = source_msg.metadata.get('tmdb_id')
+            identity_changed = bool(incoming_tmdb and (existing.tmdb_id is None or int(existing.tmdb_id) != int(incoming_tmdb)))
+            content_changed = bool(incoming_hash and incoming_hash != previous_hash)
+            new_evidence = content_changed or identity_changed
             # A Telegram message may contain a season pack and Scout invokes
             # ingest once per missing episode using the same source message.
             # Reuse is message+episode scoped, not message scoped.
@@ -74,7 +163,7 @@ class ChannelIngestService:
             incoming_urls.extend(url for url in source_msg.urls if url not in incoming_urls)
             incoming_share = source_msg.metadata.get('share_url') or (incoming_urls[0] if incoming_urls else None)
             same_share = bool(incoming_share and share_hash(incoming_share) == existing.share_hash)
-            if not additional_episodes and same_share:
+            if not additional_episodes and same_share and not new_evidence:
                 target_episodes = set(new_episodes)
                 source_resources = select(Resource.id).where(
                     Resource.source_channel_id == source_msg.channel_id,
@@ -151,9 +240,11 @@ class ChannelIngestService:
                 }
             # Ingest only newly requested episode(s); never re-enqueue episodes
             # already represented by this source message/job.
-            source_msg = source_msg.model_copy(update={
-                'metadata': {**source_msg.metadata, 'episode_keys': sorted(additional_episodes)},
-            })
+            episode_keys_to_process = additional_episodes if additional_episodes else (new_episodes if new_evidence else set())
+            if episode_keys_to_process:
+                source_msg = source_msg.model_copy(update={
+                    'metadata': {**source_msg.metadata, 'episode_keys': sorted(episode_keys_to_process)},
+                })
         payload = source_msg.model_dump(mode='json')
         urls = extract_urls(f'{source_msg.text} {source_msg.caption}', source_msg.entities, source_msg.button_urls)
         urls.extend(x for x in source_msg.urls if x not in urls)
@@ -164,12 +255,15 @@ class ChannelIngestService:
         episodes = canonical_episode_keys(raw_episodes, season=season)
         tmdb_id = source_msg.metadata.get('tmdb_id')
         title = source_msg.metadata.get('title') or clean_title(source_msg.text or source_msg.caption)
+        database_title = title[:512]
         if tmdb_id is None:
             tmdb_id = await ChannelIngestService._resolve_tmdb_from_watchlist(db, title=title, season=season)
         media_type = source_msg.metadata.get('media_type') or ('movie' if source_msg.metadata.get('is_movie') else 'tv')
+        resource_content_hash = str(source_msg.metadata.get('resource_content_hash') or '').strip()
         parsed = {**payload, 'urls': urls, 'share_url': share_url, 'source_type': source_type,
                   'is_forward': bool(source_msg.is_forward), 'episode_keys': episodes,
                   'tmdb_id': tmdb_id, 'title': title, 'media_type': media_type,
+                  'resource_content_hash': resource_content_hash or None,
                   'transfer_mode': 'AUTO' if decision.auto_transfer else 'MANUAL'}
         message_row = await db.scalar(select(ChannelIngestMessage).where(
             ChannelIngestMessage.channel_id == source_msg.channel_id,
@@ -220,7 +314,7 @@ class ChannelIngestService:
             job = ChannelIngestJob(channel_id=source_msg.channel_id, message_id=source_msg.message_id,
                                    source_type=source_type, is_forward=source_msg.is_forward, share_url=share_url,
                                    share_hash=digest, status=INGEST_NEEDS_REVIEW, parsed_data=parsed,
-                                   media_type=media_type, tmdb_id=tmdb_id, title=title, season=season,
+                                   media_type=media_type, tmdb_id=tmdb_id, title=database_title, season=season,
                                    detected_episodes=episodes)
             db.add(job)
             await db.flush()
@@ -230,7 +324,7 @@ class ChannelIngestService:
             job.detected_episodes = combined_episodes
             job.parsed_data = {**dict(job.parsed_data or {}), **parsed, 'episode_keys': combined_episodes}
             job.tmdb_id = int(tmdb_id) if tmdb_id is not None else job.tmdb_id
-            job.title = title or job.title
+            job.title = database_title or job.title
             job.season = season or job.season
             await db.flush()
         episodes = sorted(set(episodes))
@@ -243,10 +337,40 @@ class ChannelIngestService:
                                       version_key=str(source_msg.metadata.get('version_key') or ''))
         resource = await DedupService.find_existing(db, identity)
         if resource:
+            pending_task = None
+            if new_evidence:
+                pending_task = await ChannelIngestService._reactivate_pending_task_with_new_evidence(
+                    db,
+                    resource=resource,
+                    episode_keys=episodes,
+                    share_url=share_url,
+                    source_msg=source_msg,
+                )
+            if pending_task is not None:
+                job.status = INGEST_COMPLETED
+                job.identity_status = 'IDENTIFIED'
+                job.ready_for_transfer = True
+                job.transfer_status = 'QUEUED'
+                job.error_message = None
+                job.parsed_data = {**dict(job.parsed_data or {}), **parsed}
+                await db.flush()
+                return {
+                    'job_id': job.id,
+                    'resource_id': resource.id,
+                    'queue_task_id': pending_task.id,
+                    'existing_task_id': pending_task.id,
+                    'status': job.status,
+                    'queued': True,
+                    'deduplicated': True,
+                    'queue_reused': True,
+                    'queued_reactivated': True,
+                    'stale_pending_recovered': True,
+                    'is_forward': job.is_forward,
+                }
             job.status = INGEST_COMPLETED; job.identity_status = 'DUPLICATE'; job.ready_for_transfer = False
             job.transfer_status = 'SKIPPED_DUPLICATE'; await db.flush()
             return {'job_id': job.id, 'resource_id': resource.id, 'status': job.status, 'deduplicated': True, 'is_forward': job.is_forward}
-        resource = Resource(identity_key=identity, tmdb_id=int(tmdb_id), title=title, media_type=media_type,
+        resource = Resource(identity_key=identity, tmdb_id=int(tmdb_id), title=database_title, media_type=media_type,
                             year=source_msg.metadata.get('year'), season=season,
                             episode=int(episodes[0].split('E')[1]) if len(episodes) == 1 and 'E' in episodes[0] else None,
                             episode_key=canonical_episode_key(season, episodes[0]) if len(episodes) == 1 else None,

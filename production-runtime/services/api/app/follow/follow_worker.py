@@ -93,8 +93,10 @@ async def _collect_promotion_physical_evidence(
             conflict = await adapter.inspect_completed_root_conflict_readonly(
                 auth_token=str(config.auth_ref),
                 completed_root_id=str(config.target_folder_id),
+                ongoing_root_id=str(config.ongoing_target_folder_id or ''),
                 tmdb_id=tmdb_id,
                 title=str(watchlist.title or resource.title or ''),
+                media_root='电视剧',
             )
             scans[tmdb_id] = dict(scan)
             conflicts[tmdb_id] = bool(conflict.get('conflict'))

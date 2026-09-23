@@ -43,6 +43,11 @@ from app.follow.follow_mode import FULL, LATEST, normalize_follow_mode
 from app.follow.missing_episode_service import MissingEpisodeService
 from app.follow.radar_service import RadarService
 from app.follow.watchlist_service import WatchlistService
+from app.follow.worker_heartbeat import (
+    TRANSFER_WORKER_HEARTBEAT_KEY,
+    read_transfer_worker_heartbeat,
+    transfer_worker_settings_lines,
+)
 from app.models.admin import TelegramAdmin, TelegramUser
 from app.models.auto_ingest_history import AutoIngestHistory
 from app.models.cloud import CloudDiskInventory
@@ -1794,6 +1799,8 @@ def build_dispatcher() -> Dispatcher:
             follow_paused = await BotSettingsService.is_follow_paused(db)
             transfer_paused = await BotSettingsService.is_transfer_paused(db)
             ai = await BotSettingsService.is_auto_ingest_enabled(db)
+            heartbeat_raw = await BotSettingsService.get(db, TRANSFER_WORKER_HEARTBEAT_KEY)
+            worker_lines = transfer_worker_settings_lines(read_transfer_worker_heartbeat(heartbeat_raw))
             queue_counts = dict(
                 (await db.execute(
                     select(TransferQueueTask.status, func.count(TransferQueueTask.id)).group_by(TransferQueueTask.status)
@@ -1818,14 +1825,18 @@ def build_dispatcher() -> Dispatcher:
             f"🌐 环境：<code>{cfg.app_env}</code>\n"
             f"追新：<code>{follow_state}</code>\n"
             f"转存：<code>{transfer_state}</code>\n"
-            f'☁️ 云盘写入：<code>{"启用" if cfg.cloud_write_enabled else "禁用"}</code>\n'
+            f'🧰 Transfer Worker：<code>{worker_lines["worker"]}</code>\n'
+            f'☁️ 云盘写入：<code>{worker_lines["cloud_write"]}</code>\n'
+            f'🏷 Release：<code>{escape(worker_lines["release"])}</code>\n'
             f'🔥 自动入库：<code>{"开" if ai else "关"}</code>\n'
             f'👤 当前权限：<code>{principal.role}</code>\n'
             f'✅ 成功通知：<code>{escape(channel_targets["transfer_success_chat"])}</code>\n'
             f'📣 资源发布：<code>{escape(channel_targets["resource_publish_chat"])}</code> · PUBLISH_ONLY\n\n'
             "<b>队列</b>\n"
             f"QUEUED: <code>{queue_counts.get('QUEUED', 0)}</code>\n"
+            f"RUNNING: <code>{queue_counts.get('RUNNING', 0)}</code>\n"
             f"RETRY_WAIT: <code>{queue_counts.get('RETRY_WAIT', 0)}</code>\n"
+            f"PENDING: <code>{queue_counts.get('PENDING', 0)}</code>\n"
             f"FAILED: <code>{queue_counts.get('FAILED', 0)}</code>",
             reply_markup=builder.as_markup(),
             parse_mode="HTML",

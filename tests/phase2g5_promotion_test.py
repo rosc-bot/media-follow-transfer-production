@@ -38,6 +38,24 @@ async def test_physical_scan_is_paginated_bounded_and_watermarked():
 
 
 @pytest.mark.asyncio
+async def test_physical_scan_rejects_duplicate_season_directories():
+    async def list_page(parent_id, _page, _page_size):
+        if parent_id == "series":
+            return {"items": [
+                {"id": "s02", "name": "S02", "resType": 2},
+                {"id": "season-cn", "name": "第二季", "resType": 2},
+            ], "hasMore": False}
+        return {"items": [], "hasMore": False}
+
+    scanner = PhysicalCloudInventoryScanner(list_page, page_size=20, rate_limit_seconds=0)
+    result = await scanner.scan(tmdb_id=1, series_root_id="series", relevant_seasons=[2])
+
+    assert result.scan_status == "LAYOUT_CONFLICT_UNVERIFIED"
+    assert result.scan_watermark is None
+    assert result.layout_conflicts[0]["code"] == "DUPLICATE_SEASON_ROOT"
+
+
+@pytest.mark.asyncio
 async def test_full_page_without_pagination_proof_fails_closed():
     async def list_page(_parent_id, _page, _page_size):
         return {"items": [{"id": "e1", "name": "测试剧.S01E01.mkv", "resType": 1}]}

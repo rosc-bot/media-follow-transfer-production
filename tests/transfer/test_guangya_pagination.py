@@ -22,7 +22,8 @@ class ScriptedGuangyaAdapter(GuangyaAdapter):
         if url.endswith('/file/get_file_list'):
             self.target_reads += 1
             files = [] if self.target_reads == 1 else [
-                {'name': 'one.mkv', 'resType': 1}, {'name': 'two.mkv', 'resType': 1},
+                {'fileId': 'target-one', 'name': 'one.mkv', 'resType': 1},
+                {'fileId': 'target-two', 'name': 'two.mkv', 'resType': 1},
             ]
             return {'code': 0, 'data': {'list': files, 'hasMore': False}}
         raise AssertionError(url)
@@ -73,8 +74,8 @@ class NestedFolderGuangyaAdapter(GuangyaAdapter):
             return {'code': 0, 'data': {}}
         if url.endswith('/file/get_file_list'):
             return {'code': 0, 'data': {'list': [
-                {'name': 'S01E01.mkv', 'resType': 1},
-                {'name': 'S01E02.mkv', 'resType': 1},
+                {'fileId': 'target-ep1', 'name': 'S01E01.mkv', 'resType': 1},
+                {'fileId': 'target-ep2', 'name': 'S01E02.mkv', 'resType': 1},
             ], 'hasMore': False}}
         raise AssertionError(url)
 

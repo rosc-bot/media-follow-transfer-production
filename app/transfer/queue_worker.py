@@ -368,6 +368,8 @@ class TransferQueueWorker:
                 raise RuntimeError(f'网盘提供商 {provider} 未配置')
             if not cloud_cfg.enabled:
                 raise RuntimeError(f'网盘提供商 {provider} 已在配置中禁用')
+            payload['ongoing_root_id'] = str(cloud_cfg.ongoing_target_folder_id or '').strip()
+            payload['completed_root_id'] = str(cloud_cfg.target_folder_id or '').strip()
             if not payload.get('auth_token') and cloud_cfg.auth_ref:
                 payload['auth_token'] = cloud_cfg.auth_ref
 
@@ -1951,7 +1953,8 @@ class TransferQueueWorker:
         category = classify_error(exc)
         message = str(exc) or exc.__class__.__name__
         rename_resume = isinstance(exc, RenameUnverifiedError)
-        promotion_resume = isinstance(exc, PromotionUnverifiedError)
+        promotion_operation = str(payload.get('operation') or '').strip().casefold() == 'promote'
+        promotion_resume = False
         exception_code = str(getattr(exc, 'code', '') or '')
         scope_integrity_failure = (
             category == TransferErrorCategory.TRANSFER_SCOPE_VIOLATION
@@ -1963,6 +1966,39 @@ class TransferQueueWorker:
                 logger.warning('transfer task %s disappeared before failure recording', task_id)
                 return True
             resource = await db.get(Resource, resource_id) if resource_id is not None else None
+            persisted_payload = dict(task.payload or {})
+            stage = str(payload.get('promotion_stage') or persisted_payload.get('promotion_stage') or '').upper()
+            promotion_fenced = stage in {'MOVE_SUBMITTED', 'MOVED'}
+            promotion_resume = promotion_operation and promotion_fenced
+            if promotion_operation and isinstance(exc, PromotionUnverifiedError) and not promotion_fenced:
+                task.status = 'PENDING'
+                task.error_message = f'[PROMOTION_NEEDS_REVIEW] {message}'[:4000]
+                task.payload = {
+                    **persisted_payload,
+                    **payload,
+                    'promotion_status': 'NEEDS_REVIEW',
+                    'preflight_classification': 'NEEDS_REVIEW',
+                    'preflight_reason': 'PROMOTION_ROOT_OR_SOURCE_NOT_VERIFIED',
+                }
+                task.locked_at = None
+                task.locked_by = None
+                await db.flush()
+                return False
+            if category == TransferErrorCategory.FILE_SELECTION_REVIEW:
+                review_code = str(getattr(exc, 'code', '') or category)
+                task.status = 'PENDING'
+                task.error_message = f'[FINAL_PREFLIGHT:NEEDS_REVIEW] {review_code} {message}'[:4000]
+                task.payload = {
+                    **persisted_payload,
+                    **payload,
+                    'preflight_classification': 'NEEDS_REVIEW',
+                    'preflight_reason': review_code,
+                    'structural_conflict': True,
+                }
+                task.locked_at = None
+                task.locked_by = None
+                await db.flush()
+                return False
             if (
                 str(payload.get('provider') or getattr(resource, 'cloud_name', '') or '').casefold() == 'guangya'
                 and category in {
@@ -2000,8 +2036,9 @@ class TransferQueueWorker:
                     task.payload = {
                         **dict(task.payload or {}),
                         **payload,
-                        'promotion_stage': 'MOVED',
+                        'promotion_stage': stage,
                         'promotion_series_folder_id': getattr(resume_exc, 'series_folder_id', None) or payload.get('promotion_series_folder_id'),
+                        'promotion_status': 'PROMOTION_UNVERIFIED',
                         'promotion_readback': {
                             'status': 'PROMOTION_UNVERIFIED',
                             'error': message[:1000],

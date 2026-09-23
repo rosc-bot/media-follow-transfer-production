@@ -55,7 +55,7 @@ def _payload(**overrides):
 async def test_expected_empty_uses_selected_names_for_readback_verification():
     adapter = VideoVerificationAdapter(
         share_files=[{'fileId': '1', 'name': 'a.mkv', 'resType': 1}, {'fileId': '2', 'name': 'b.mp4', 'resType': 1}],
-        readback_files=[{'name': 'a.mkv', 'resType': 1}, {'name': 'b.mp4', 'resType': 1}],
+        readback_files=[{'fileId': 'target-a', 'name': 'a.mkv', 'resType': 1}, {'fileId': 'target-b', 'name': 'b.mp4', 'resType': 1}],
     )
 
     outcome = await adapter.transfer(_payload(selection_mode='WHOLE_SHARE', expected_files=[]))
@@ -94,7 +94,7 @@ async def test_share_with_only_subtitles_and_images_raises_no_video_files():
 async def test_readback_missing_files_raises_readback_unverified():
     adapter = VideoVerificationAdapter(
         share_files=[{'fileId': '1', 'name': 'a.mkv', 'resType': 1}, {'fileId': '2', 'name': 'b.mkv', 'resType': 1}],
-        readback_files=[{'name': 'a.mkv', 'resType': 1}],  # b.mkv missing after restore
+        readback_files=[{'fileId': 'target-a', 'name': 'a.mkv', 'resType': 1}],  # b.mkv missing after restore
     )
 
     with pytest.raises(ReadbackVerificationError):
@@ -106,7 +106,7 @@ async def test_readback_missing_files_raises_readback_unverified():
 async def test_readback_with_all_expected_files_is_verified_success():
     adapter = VideoVerificationAdapter(
         share_files=[{'fileId': '1', 'name': 'a.mkv', 'resType': 1}],
-        readback_files=[{'name': 'a.mkv', 'resType': 1}],
+        readback_files=[{'fileId': 'target-a', 'name': 'a.mkv', 'resType': 1}],
     )
 
     outcome = await adapter.transfer(_payload(expected_files=['a.mkv']))
@@ -121,7 +121,7 @@ async def test_readback_with_all_expected_files_is_verified_success():
 async def test_expected_files_missing_from_share_raises_episode_mismatch():
     adapter = VideoVerificationAdapter(
         share_files=[{'fileId': '1', 'name': 'a.mkv', 'resType': 1}],
-        readback_files=[{'name': 'a.mkv', 'resType': 1}],
+        readback_files=[{'fileId': 'target-a', 'name': 'a.mkv', 'resType': 1}],
     )
 
     from app.transfer.errors import GuangyaTransferError, TransferErrorCategory

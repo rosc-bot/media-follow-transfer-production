@@ -23,6 +23,13 @@ class PromotionResumeOrchestrator:
     async def execute(self, payload):
         self.calls.append(dict(payload))
         if len(self.calls) == 1:
+            payload.update({
+                "promotion_stage": "MOVED",
+                "promotion_series_folder_id": "series-folder",
+                "promotion_season_folder_id": "season-folder",
+                "promotion_source_parent_id": "ongoing-parent",
+                "promotion_destination_parent_id": "completed-parent",
+            })
             raise PromotionUnverifiedError(
                 "completed readback missing S01E02",
                 series_folder_id="series-folder",
@@ -96,6 +103,40 @@ async def test_promotion_failure_retries_only_readback_and_updates_inventory_pat
         ]
     assert len(orchestrator.calls) == 2
     assert orchestrator.restore_calls == 0
+    await engine.dispose()
+
+
+class PreMoveFailureOrchestrator:
+    async def execute(self, _payload):
+        raise PromotionUnverifiedError("TMDB root identity is ambiguous")
+
+
+@pytest.mark.asyncio
+async def test_promotion_error_before_move_is_review_not_a_moved_retry(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/promotion-before-move.db")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with sessions() as db, db.begin():
+        db.add(BotSettings(key="global_pause", val="0"))
+        db.add(BotSettings(key="transfer_paused", val="0"))
+        db.add(Resource(
+            id=23, identity_key="promotion-before-move", tmdb_id=23, title="待核验剧",
+            media_type="tv", season=1, episode=1, episode_key="S01E01", cloud_name="dry-run",
+            share_url="https://example/s/promotion", source_type="watchlist_scout",
+        ))
+        db.add(TransferQueueTask(
+            id=23, resource_id=23, idempotency_key="promotion-before-move-task",
+            payload={"provider": "dry-run", "operation": "promote", "promotion_source_series_folder_id": "source"},
+        ))
+    worker = TransferQueueWorker(sessions, orchestrator=PreMoveFailureOrchestrator())
+
+    assert await worker.process_once() is False
+    async with sessions() as db:
+        task = await db.get(TransferQueueTask, 23)
+        assert task.status == "PENDING"
+        assert task.payload["promotion_status"] == "NEEDS_REVIEW"
+        assert "promotion_stage" not in task.payload
     await engine.dispose()
 
 
