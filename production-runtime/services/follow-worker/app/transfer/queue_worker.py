@@ -3,9 +3,8 @@ import logging
 import os
 import re
 import socket
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -37,6 +36,13 @@ from app.transfer.final_preflight import (
 from app.transfer.missing_episode_preflight import plan_missing_episode_transfer
 from app.transfer.notifier import NotificationResult, TransferNotifier
 from app.transfer.orchestrator import TransferOrchestrator
+from app.transfer.provider_network_health import (
+    complete_provider_health_probe,
+    is_retryable_provider_failure,
+    provider_backoff_seconds,
+    provider_claim_gate,
+    record_provider_network_failure,
+)
 from app.transfer.queue_service import TransferQueueService
 from app.transfer.status import EXECUTION_ACTIVE_STATUSES, REVIEW_STATUS, TransferStatus
 from app.transfer.task_identity import task_matches_episode
@@ -121,6 +127,98 @@ class TransferQueueWorker:
         self.orchestrator = orchestrator or TransferOrchestrator()
         self.worker_id = worker_id or f'{socket.gethostname()}:{os.getpid()}'
         self.notifier = notifier if notifier is not None else TransferNotifier()
+
+    async def _provider_health_probe(self) -> bool:
+        """Perform one bounded, read-only direct-directory probe for Guangya."""
+        from app.transfer.adapters.guangya import GuangyaAdapter
+        from app.transfer.guangya_auth import GuangyaCredentialStore
+
+        async with self.session_factory() as db:
+            config = await db.scalar(select(CloudConfig).where(CloudConfig.name == 'guangya'))
+            if config is None or not config.enabled or not config.auth_ref:
+                logger.warning('Guangya provider health probe unavailable: credentials/config missing')
+                return False
+            auth_ref = str(config.auth_ref)
+            root_id = str(config.ongoing_target_folder_id or config.target_folder_id or '').strip()
+        if not root_id:
+            logger.warning('Guangya provider health probe unavailable: target root missing')
+            return False
+        adapter = GuangyaAdapter(
+            write_enabled=False,
+            credential_store=GuangyaCredentialStore(self.session_factory),
+        )
+        try:
+            await asyncio.wait_for(
+                adapter.list_directories(auth_token=auth_ref, parent_id=root_id),
+                timeout=35.0,
+            )
+        except Exception as exc:  # noqa: BLE001 - probe fails closed, no cloud write path exists
+            logger.warning('Guangya read-only health probe failed: %s', _safe_preflight_detail(exc))
+            return False
+        logger.info('Guangya read-only health probe succeeded: directory_read_success=true')
+        return True
+
+    async def _provider_claim_allowed(self) -> bool:
+        """Pause only new claims during provider cooldown; recover via read-only probe."""
+        async with self.session_factory() as db, db.begin():
+            gate = await provider_claim_gate(db)
+        if gate == 'ALLOW':
+            return True
+        if gate == 'WAIT':
+            return False
+        probe_ok = await self._provider_health_probe()
+        async with self.session_factory() as db, db.begin():
+            await complete_provider_health_probe(db, success=probe_ok)
+        if probe_ok:
+            logger.info('Guangya provider circuit closed after successful read-only probe')
+        return probe_ok
+
+    async def _defer_provider_network_failure(
+        self,
+        db: AsyncSession,
+        *,
+        task: TransferQueueTask,
+        payload: dict,
+        reason: str,
+        stage: str,
+        detail: object = '',
+    ) -> None:
+        """Release a preflight-only network failure into bounded durable retry."""
+        safe_detail = _safe_preflight_detail(RuntimeError(str(detail))) if detail else reason
+        network_attempts = int((task.payload or {}).get('preflight_network_attempts') or payload.get('preflight_network_attempts') or 0) + 1
+        now = datetime.now(UTC)
+        retry_at = now + timedelta(seconds=provider_backoff_seconds(network_attempts))
+        task.status = TransferStatus.RETRY_WAIT
+        task.next_run_at = retry_at
+        # A preflight failure has performed no business transfer attempt.
+        task.attempt_count = max(0, int(task.attempt_count or 0) - 1)
+        task.error_message = f'[PROVIDER_NETWORK_RETRY] stage={stage} reason={reason} {safe_detail}'[:4000]
+        task.locked_at = None
+        task.locked_by = None
+        merged_payload = {**dict(task.payload or {}), **payload}
+        merged_payload.pop('preflight_classification', None)
+        merged_payload.update({
+            'preflight_reason': 'PROVIDER_NETWORK_TIMEOUT' if 'TIMEOUT' in reason.upper() else 'PROVIDER_NETWORK_ERROR',
+            'preflight_stage': stage,
+            'preflight_detail': safe_detail[:800],
+            'preflight_network_attempts': network_attempts,
+            'preflight_retry_at': retry_at.isoformat(),
+        })
+        task.payload = merged_payload
+        provider = str(payload.get('provider') or '').strip().casefold()
+        if provider == 'guangya':
+            breaker = await record_provider_network_failure(db, task_id=int(task.id))
+            if breaker['state'] == 'PROVIDER_DEGRADED' and breaker.get('cooldown_until'):
+                cooldown = datetime.fromisoformat(str(breaker['cooldown_until']))
+                if cooldown.tzinfo is None:
+                    cooldown = cooldown.replace(tzinfo=UTC)
+                task.next_run_at = max(retry_at, cooldown)
+                task.payload['preflight_retry_at'] = task.next_run_at.isoformat()
+        await db.flush()
+        logger.warning(
+            'Transfer task %s deferred without global pause: network preflight stage=%s reason=%s retry_at=%s',
+            task.id, stage, reason, task.next_run_at.isoformat(),
+        )
 
     # ------------------------------------------------------------------ #
     # Canary single-task execution (Phase 2C §十四/§十五)
@@ -692,7 +790,9 @@ class TransferQueueWorker:
         if root_report.get('status') != 'VERIFIED':
             return {
                 'classification': 'NEEDS_REVIEW',
-                'reason': str(root_report.get('error') or root_report.get('status') or 'SERIES_ROOT_UNVERIFIED'),
+                'reason': 'DESTINATION_LOOKUP_API_ERROR' if root_report.get('status') == 'API_ERROR' else str(root_report.get('error') or root_report.get('status') or 'SERIES_ROOT_UNVERIFIED'),
+                'detail': str(root_report.get('error') or root_report.get('status') or 'SERIES_ROOT_UNVERIFIED'),
+                'preflight_stage': 'DESTINATION_LOOKUP',
             }
         roots = list(root_report.get('series_roots') or [])
         if len(roots) > 1:
@@ -711,7 +811,7 @@ class TransferQueueWorker:
         if root_id:
             relevant_seasons = list(payload.get('relevant_seasons') or [season])
             cloud_scan = None
-            for attempt in range(2):
+            for attempt in range(3):
                 payload['preflight_stage'] = 'CLOUD_PRESENCE_SCAN'
                 cloud_scan = await adapter.scan_series_root_readonly(
                     auth_token=str(cloud_cfg.auth_ref),
@@ -728,12 +828,17 @@ class TransferQueueWorker:
                     cloud_scan_verified = True
                     cloud_pagination_complete = True
                     break
-                if attempt == 0 and cloud_scan.get('scan_status') in {'API_ERROR', 'TIMEOUT_UNVERIFIED', 'LIMIT_UNVERIFIED'}:
-                    await asyncio.sleep(0.25)
+                if attempt < 2 and cloud_scan.get('scan_status') in {'API_ERROR', 'TIMEOUT_UNVERIFIED'}:
+                    await asyncio.sleep((1.0, 3.0)[attempt])
+                else:
+                    break
             if not cloud_scan_verified:
+                scan_status = str((cloud_scan or {}).get('scan_status') or 'UNVERIFIED')
+                scan_error = str((cloud_scan or {}).get('error') or '')
                 return {
                     'classification': 'NEEDS_REVIEW',
-                    'reason': f"PHYSICAL_CLOUD_SCAN_{(cloud_scan or {}).get('scan_status') or 'UNVERIFIED'}",
+                    'reason': f'PHYSICAL_CLOUD_SCAN_{scan_status}',
+                    'detail': scan_error,
                     'preflight_stage': 'CLOUD_PRESENCE_SCAN',
                 }
             cloud_keys = {
@@ -763,9 +868,9 @@ class TransferQueueWorker:
                     }
             cloud_files = [records[0] for records in files_by_key.values()]
 
-        payload['preflight_stage'] = 'SHARE_PROBE'
         share_listing = None
         for attempt in range(3):
+            payload['preflight_stage'] = 'SHARE_PROBE'
             try:
                 share_listing = await adapter.inspect_share(
                     share_url=str(resource.share_url),
@@ -774,10 +879,23 @@ class TransferQueueWorker:
                     max_pages=100,
                 )
                 break
-            except (httpx.TimeoutException, httpx.NetworkError):
+            except Exception as exc:  # only bounded transient retry; all other errors fail closed
+                category = classify_error(exc)
+                if category not in {
+                    TransferErrorCategory.NETWORK_TIMEOUT,
+                    TransferErrorCategory.NETWORK_ERROR,
+                    TransferErrorCategory.REMOTE_5XX,
+                    TransferErrorCategory.RATE_LIMITED,
+                }:
+                    raise
                 if attempt == 2:
-                    return {'classification': 'NEEDS_REVIEW', 'reason': 'SHARE_READ_NETWORK_TIMEOUT'}
-                await asyncio.sleep(0.5)
+                    return {
+                        'classification': 'NEEDS_REVIEW',
+                        'reason': str(category),
+                        'detail': _safe_preflight_detail(exc),
+                        'preflight_stage': 'SHARE_PROBE',
+                    }
+                await asyncio.sleep((1.0, 3.0)[attempt])
         if not share_listing or not share_listing.get('share_readable') or share_listing.get('truncated'):
             return {'classification': 'NEEDS_REVIEW', 'reason': 'SHARE_UNREADABLE_OR_TRUNCATED'}
         payload['preflight_stage'] = 'INVENTORY_READ'
@@ -975,6 +1093,17 @@ class TransferQueueWorker:
                 except Exception as exc:
                     stage = str(payload.get('preflight_stage') or 'UNKNOWN')
                     detail = _safe_preflight_detail(exc)
+                    category = classify_error(exc)
+                    reason = (
+                        str(category)
+                        if category in {
+                            TransferErrorCategory.NETWORK_TIMEOUT,
+                            TransferErrorCategory.NETWORK_ERROR,
+                            TransferErrorCategory.REMOTE_5XX,
+                            TransferErrorCategory.RATE_LIMITED,
+                        }
+                        else 'BATCH_PREFLIGHT_EXCEPTION'
+                    )
                     safe_exc = RuntimeError(detail)
                     logger.exception(
                         'Batch preflight failed task_id=%s resource_id=%s tmdb_id=%s season=%s stage=%s episode_count=%s exception_type=%s detail=%s',
@@ -984,7 +1113,7 @@ class TransferQueueWorker:
                     )
                     batch_plan = {
                         'classification': 'NEEDS_REVIEW',
-                        'reason': 'BATCH_PREFLIGHT_EXCEPTION',
+                        'reason': reason,
                         'detail': detail,
                         'preflight_stage': stage,
                     }
@@ -1006,6 +1135,17 @@ class TransferQueueWorker:
                         missing_episode_keys=[],
                     )
                 batch_stage = str(batch_plan.get('preflight_stage') or payload.get('preflight_stage') or 'UNKNOWN')
+                batch_detail = batch_plan.get('detail') or batch_plan.get('error') or ''
+                if is_retryable_provider_failure(batch_reason, detail=batch_detail, stage=batch_stage):
+                    await self._defer_provider_network_failure(
+                        db,
+                        task=task,
+                        payload=payload,
+                        reason=batch_reason,
+                        stage=batch_stage,
+                        detail=batch_detail,
+                    )
+                    return None
                 if batch_classification != AUTO_SAFE:
                     task.status = REVIEW_STATUS
                     if batch_reason == 'NO_MISSING_EPISODES':
@@ -1101,6 +1241,19 @@ class TransferQueueWorker:
 
             classification = str(decision['classification'])
             reason = str(decision['reason'])
+            decision_stage = str(payload.get('preflight_stage') or 'SHARE_PROBE')
+            if classification != AUTO_SAFE and is_retryable_provider_failure(
+                reason, detail=decision.get('detail') or '', stage=decision_stage
+            ):
+                await self._defer_provider_network_failure(
+                    db,
+                    task=task,
+                    payload=payload,
+                    reason=reason,
+                    stage=decision_stage,
+                    detail=decision.get('detail') or '',
+                )
+                return None
             if classification != AUTO_SAFE:
                 task.status = 'PENDING'
                 task.error_message = f'[FINAL_PREFLIGHT:{classification}] {reason}'[:4000]
@@ -1224,6 +1377,13 @@ class TransferQueueWorker:
 
     async def _claim_payload(self) -> tuple[int, int | None, dict] | None:
         """Claim one task and hydrate its payload; returns (task_id, resource_id, payload)."""
+        async with self.session_factory() as db:
+            if await BotSettingsService.is_transfer_paused(db):
+                logger.info('Transfer queue consumption skipped: transfer pause is enabled')
+                return None
+        if not await self._provider_claim_allowed():
+            logger.info('Transfer queue consumption deferred by Guangya provider circuit')
+            return None
         async with self.session_factory() as db, db.begin():
             if await BotSettingsService.is_transfer_paused(db):
                 logger.info('Transfer queue consumption skipped: transfer pause is enabled')
@@ -1803,6 +1963,16 @@ class TransferQueueWorker:
                 logger.warning('transfer task %s disappeared before failure recording', task_id)
                 return True
             resource = await db.get(Resource, resource_id) if resource_id is not None else None
+            if (
+                str(payload.get('provider') or getattr(resource, 'cloud_name', '') or '').casefold() == 'guangya'
+                and category in {
+                    TransferErrorCategory.NETWORK_TIMEOUT,
+                    TransferErrorCategory.NETWORK_ERROR,
+                    TransferErrorCategory.REMOTE_5XX,
+                    TransferErrorCategory.RATE_LIMITED,
+                }
+            ):
+                await record_provider_network_failure(db, task_id=int(task.id))
             if scope_integrity_failure:
                 await BotSettingsService.set_transfer_paused(db, True)
                 task.status = 'PENDING'

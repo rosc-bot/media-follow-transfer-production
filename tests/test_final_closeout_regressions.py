@@ -324,10 +324,11 @@ async def test_batch_preflight_timeout_is_bounded_and_releases_task_lock(tmp_pat
     assert elapsed < 1
     async with sessions() as db:
         task = await db.get(TransferQueueTask, 902)
-        assert task.status == "PENDING"
+        assert task.status == "RETRY_WAIT"
         assert task.locked_at is None and task.locked_by is None
-        assert task.payload["preflight_reason"] == "BATCH_PREFLIGHT_TIMEOUT"
+        assert task.payload["preflight_reason"] == "PROVIDER_NETWORK_TIMEOUT"
         assert task.payload["preflight_stage"] == "CLOUD_PRESENCE_SCAN"
+        assert task.attempt_count == 0
     await engine.dispose()
 
 

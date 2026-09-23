@@ -18,7 +18,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
+
 from app.transfer.episode_matcher import extract_video_episode_keys
+from app.transfer.errors import TransferErrorCategory, classify_error
 from app.transfer.guangya_auth import is_video_filename
 
 ListPage = Callable[[str, int, int], Awaitable[Any] | Any]
@@ -271,12 +274,16 @@ class PhysicalCloudInventoryScanner:
                     break
                 if self.rate_limit_seconds and queue:
                     await asyncio.sleep(self.rate_limit_seconds)
-        except TimeoutError:
+        except (TimeoutError, httpx.TimeoutException) as exc:
             status = "TIMEOUT_UNVERIFIED"
-            error = "LIST_PAGE_TIMEOUT"
+            error = f"{TransferErrorCategory.NETWORK_TIMEOUT}:{type(exc).__name__}"
+        except httpx.HTTPStatusError as exc:
+            status = "API_ERROR"
+            error = f"{classify_error(exc)}:HTTPStatusError:{int(exc.response.status_code)}"
         except Exception as exc:  # noqa: BLE001 - scanner must fail closed
             status = "API_ERROR"
-            error = type(exc).__name__
+            category = classify_error(exc)
+            error = f"{category}:{type(exc).__name__}" if category != TransferErrorCategory.UNKNOWN else type(exc).__name__
 
         if unparsed and status == "VERIFIED":
             status = "UNPARSED_UNVERIFIED"
