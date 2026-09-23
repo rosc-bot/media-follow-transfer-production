@@ -348,16 +348,33 @@ def build_rename_plan(
     cloud_count: int | None = None,
     active_transfer_count: int | None = None,
     aliases: list[str] | None = None,
+    episode_keys_by_file_id: dict[str, str] | None = None,
 ) -> RenamePlan:
     """Plan a conditional rename only for selected files in verified readback."""
 
     del version_key  # retained in the call contract for queue compatibility
+    aliases = list(aliases or [])
+    episode_keys_by_file_id = {
+        str(file_id).strip(): str(key).strip()
+        for file_id, key in (episode_keys_by_file_id or {}).items()
+        if str(file_id).strip() and str(key).strip()
+    }
     selected = {str(value).strip() for value in selected_file_ids if str(value).strip()}
-    records = [
+    raw_records = [
         {"file_id": _record_id(record), "name": _record_name(record)}
         for record in verified_records
         if _record_id(record) and _record_name(record)
     ]
+    deduplicated: dict[str, dict[str, str]] = {}
+    for record in raw_records:
+        key = f"id:{record['file_id']}"
+        prior = deduplicated.get(key)
+        if prior is not None:
+            if prior["name"] != record["name"]:
+                return RenamePlan("RENAME_UNVERIFIED", reason="DUPLICATE_FILE_ID_CONFLICT")
+            continue
+        deduplicated[key] = record
+    records = list(deduplicated.values())
     if not selected:
         return RenamePlan("RENAME_UNVERIFIED", reason="SELECTED_FILE_IDS_REQUIRED")
     selected_records = [record for record in records if record["file_id"] in selected]
@@ -410,7 +427,7 @@ def build_rename_plan(
                 year=year,
                 tmdb_id=tmdb_id,
                 season=season,
-                episode_key=episode_key,
+                episode_key=episode_keys_by_file_id.get(record["file_id"]) or episode_key,
                 source_filename=old_name,
             )
         selected_targets[record["file_id"]] = target

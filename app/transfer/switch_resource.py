@@ -28,6 +28,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.follow.episode_keys import canonical_episode_key
 from app.models.resource import Resource
 from app.models.transfer import TransferQueueTask
 from app.scout.message_search import MessageSearch
@@ -39,6 +40,7 @@ from app.transfer.candidate_service import (
     stable_share_key,
 )
 from app.transfer.queue_service import TransferQueueService
+from app.transfer.status import EXECUTION_ACTIVE_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -169,71 +171,162 @@ async def switch_resource(
             f'未找到《{title}》S{int(season or 1):02d} 的其它可用资源'
         )
 
-    # 7/8. Enqueue new tasks for the chosen alternatives (idempotent per share).
-    # NOTE: idempotency_key is keyed on resource_id, so a new Resource gets a
-    # fresh key even for the same share — dedup here by actual task payload
-    # (tmdb_id + episodes + share_url) so an already-queued alternative is
-    # reused instead of duplicated.
-    active_statuses = ('QUEUED', 'RETRY_WAIT', 'RUNNING', 'PENDING')
+    # Group episode-level candidate picks by the actual share identity before
+    # creating Resources or queue rows. One share that covers several missing
+    # episodes becomes one Resource and one MISSING_EPISODES task.
     active_tasks = (await db.execute(
-        select(TransferQueueTask).where(TransferQueueTask.status.in_(active_statuses))
+        select(TransferQueueTask).where(TransferQueueTask.status.in_(EXECUTION_ACTIVE_STATUSES))
     )).scalars().all()
-    new_tasks: list[dict] = []
-    for episode_key, pick in chosen_by_episode.items():
+    groups: dict[tuple[str, str], dict] = {}
+    for raw_episode_key, pick in chosen_by_episode.items():
+        episode_key = canonical_episode_key(int(season or 1), raw_episode_key)
         chosen_url = str(pick['share_url'])
-        chosen_source_channel = pick.get('source_channel_id') or source_channel or ''
-        chosen_source_msg = pick.get('source_message_id') or int(source_msg or 0) or None
         provider = 'guangya'
-        if 'quark' in chosen_url:
+        if 'quark' in chosen_url.casefold():
             provider = 'quark'
-        elif 'baidu' in chosen_url:
+        elif 'baidu' in chosen_url.casefold():
             provider = 'baidu'
-        elif '115' in chosen_url:
+        elif '115' in chosen_url.casefold():
             provider = '115'
-        elif 'alipan' in chosen_url or 'aliyundrive' in chosen_url:
+        elif 'alipan' in chosen_url.casefold() or 'aliyundrive' in chosen_url.casefold():
             provider = 'aliyun'
-        existing = next(
-            (t for t in active_tasks
-             if str((t.payload or {}).get('share_url') or '') == chosen_url
-             and int((t.payload or {}).get('tmdb_id') or 0) == int(tmdb_id)
-             and str(episode_key) in {str(e) for e in (t.payload or {}).get('episode_keys') or []}),
-            None,
-        )
-        if existing:
-            new_tasks.append({'episode_key': episode_key, 'task_id': existing.id, 'status': existing.status, 'reused': True})
-            continue
-        new_resource = Resource(
-            identity_key=f'{int(tmdb_id)}:{provider}:{episode_key}',
-            tmdb_id=int(tmdb_id),
-            title=title,
-            media_type='tv',
-            season=int(season or 1),
-            episode=int(episode_key.split('E')[1]),
-            episode_key=episode_key,
-            cloud_name=provider,
-            share_url=chosen_url,
-            source_type='watchlist_scout',
-            source_channel_id=str(chosen_source_channel or ''),
-            source_message_id=chosen_source_msg,
-        )
-        db.add(new_resource)
-        await db.flush()
-        task = await TransferQueueService.enqueue(
-            db, resource_id=new_resource.id, provider=provider,
-            payload={'resource_id': new_resource.id, 'share_url': chosen_url,
-                     'episode_keys': [episode_key], 'tmdb_id': int(tmdb_id), 'title': title,
-                     'season': int(season or 1), 'source_type': 'watchlist_scout',
-                     'source_channel_id': str(chosen_source_channel or ''), 'source_message_id': chosen_source_msg or 0},
-            episode_keys=[episode_key],
-        )
-        pick_candidate = pick.get('candidate')
-        if pick_candidate is not None:
-            from app.transfer.candidate_service import mark_candidate_used
+        group_key = (provider, stable_share_key(chosen_url))
+        group = groups.setdefault(group_key, {
+            'provider': provider,
+            'share_url': chosen_url,
+            'episode_keys': [],
+            'picks': {},
+            'source_channel_id': pick.get('source_channel_id') or source_channel or '',
+            'source_message_id': pick.get('source_message_id') or int(source_msg or 0) or None,
+        })
+        if episode_key and episode_key not in group['episode_keys']:
+            group['episode_keys'].append(episode_key)
+            group['picks'][episode_key] = pick
 
-            pick_candidate.resource_id = new_resource.id
-            pick_candidate.queue_task_id = task.id
-            await mark_candidate_used(db, candidate=pick_candidate, queue_task_id=task.id)
-        new_tasks.append({'episode_key': episode_key, 'task_id': task.id, 'status': task.status, 'reused': False})
+    new_tasks: list[dict] = []
+    for group in groups.values():
+        provider = group['provider']
+        chosen_url = group['share_url']
+        group_episode_keys = sorted(
+            group['episode_keys'],
+            key=lambda value: (int(value[1:3]), int(value.split('E', 1)[1])),
+        )
+        if not group_episode_keys:
+            continue
+        active_by_episode: dict[str, TransferQueueTask] = {}
+        for active_task in active_tasks:
+            active_payload = dict(active_task.payload or {})
+            active_url = str(active_payload.get('share_url') or '')
+            try:
+                same_identity = (
+                    int(active_payload.get('tmdb_id') or 0) == int(tmdb_id)
+                    and int(active_payload.get('season') or season or 1) == int(season or 1)
+                    and bool(active_url)
+                    and stable_share_key(active_url) == stable_share_key(chosen_url)
+                )
+            except (TypeError, ValueError):
+                same_identity = False
+            if not same_identity:
+                continue
+            active_keys = {
+                key
+                for value in (active_payload.get('episode_keys') or [])
+                if (key := canonical_episode_key(int(season or 1), value)) is not None
+            }
+            for episode_key in group_episode_keys:
+                if episode_key in active_keys:
+                    active_by_episode.setdefault(episode_key, active_task)
+
+        reused_by_task: dict[int, list[str]] = {}
+        for episode_key, active_task in active_by_episode.items():
+            reused_by_task.setdefault(active_task.id, []).append(episode_key)
+        for active_task_id, reused_keys in reused_by_task.items():
+            active_task = next(task for task in active_tasks if task.id == active_task_id)
+            for episode_key in reused_keys:
+                pick = group['picks'][episode_key]
+                candidate = pick.get('candidate')
+                if candidate is not None:
+                    candidate.resource_id = active_task.resource_id
+                    candidate.queue_task_id = active_task.id
+                    from app.transfer.candidate_service import mark_candidate_used
+
+                    await mark_candidate_used(db, candidate=candidate, queue_task_id=active_task.id)
+            new_tasks.append({
+                'episode_key': reused_keys[0],
+                'episode_keys': sorted(reused_keys),
+                'task_id': active_task.id,
+                'status': active_task.status,
+                'reused': True,
+            })
+
+        remaining_keys = [key for key in group_episode_keys if key not in active_by_episode]
+        if not remaining_keys:
+            continue
+        chosen_source_channel = str(group['source_channel_id'] or '')
+        chosen_source_msg = group['source_message_id']
+        season_number = int(season or 1)
+        identity_key = f'{int(tmdb_id)}:{provider}:S{season_number:02d}:{stable_share_key(chosen_url)}'
+        new_resource = await db.scalar(select(Resource).where(Resource.identity_key == identity_key))
+        if new_resource is None:
+            first_episode = remaining_keys[0]
+            new_resource = Resource(
+                identity_key=identity_key,
+                tmdb_id=int(tmdb_id),
+                title=title,
+                media_type='tv',
+                season=season_number,
+                episode=int(first_episode.split('E', 1)[1]),
+                episode_key=first_episode,
+                cloud_name=provider,
+                share_url=chosen_url,
+                source_type='watchlist_scout',
+                source_channel_id=chosen_source_channel,
+                source_message_id=chosen_source_msg,
+            )
+            db.add(new_resource)
+            await db.flush()
+        else:
+            new_resource.status = 'READY'
+            new_resource.title = title
+            new_resource.share_url = chosen_url
+            new_resource.source_channel_id = chosen_source_channel
+            new_resource.source_message_id = chosen_source_msg
+
+        task_payload = {
+            'resource_id': new_resource.id,
+            'share_url': chosen_url,
+            'episode_keys': remaining_keys,
+            'selected_episode_keys': remaining_keys,
+            'selection_mode': 'MISSING_EPISODES',
+            'tmdb_id': int(tmdb_id),
+            'title': title,
+            'season': season_number,
+            'source_type': 'watchlist_scout',
+            'source_channel_id': chosen_source_channel,
+            'source_message_id': chosen_source_msg or 0,
+        }
+        task = await TransferQueueService.enqueue(
+            db,
+            resource_id=new_resource.id,
+            provider=provider,
+            payload=task_payload,
+            episode_keys=remaining_keys,
+        )
+        for episode_key in remaining_keys:
+            candidate = group['picks'][episode_key].get('candidate')
+            if candidate is not None:
+                candidate.resource_id = new_resource.id
+                candidate.queue_task_id = task.id
+                from app.transfer.candidate_service import mark_candidate_used
+
+                await mark_candidate_used(db, candidate=candidate, queue_task_id=task.id)
+        new_tasks.append({
+            'episode_key': remaining_keys[0],
+            'episode_keys': remaining_keys,
+            'task_id': task.id,
+            'status': task.status,
+            'reused': False,
+        })
 
     return {
         'tmdb_id': int(tmdb_id),

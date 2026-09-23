@@ -210,7 +210,7 @@ async def test_persist_atomically_replaces_both_tokens_when_api_returns_new_refr
 class FakeRefreshServer:
     """Acts as the account endpoint returning new tokens without touching the network."""
 
-    async def post(self, url, json, headers):
+    async def post(self, url, json, headers, **kwargs):
         return httpx.Response(200, json={
             'access_token': 'super-secret-new-access',
             'refresh_token': 'super-secret-new-refresh',
@@ -249,7 +249,7 @@ class HeaderRecordingRefreshServer(FakeRefreshServer):
     def __init__(self):
         self.captured_headers = None
 
-    async def post(self, url, json, headers):
+    async def post(self, url, json, headers, **kwargs):
         self.captured_headers = dict(headers)
         return await super().post(url, json, headers)
 
@@ -379,3 +379,81 @@ async def test_auth_expired_never_enters_exponential_retry(tmp_path):
         assert net_task.status == TransferStatus.RETRY_WAIT  # network errors still retry
         assert net_task.next_run_at is not None
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_refresh_retries_a_transient_timeout_once_with_a_bounded_request():
+    class TimeoutThenSuccess:
+        def __init__(self):
+            self.calls = 0
+            self.timeouts = []
+
+        async def post(self, url, json, headers, **kwargs):
+            self.calls += 1
+            self.timeouts.append(kwargs.get("timeout"))
+            if self.calls == 1:
+                request = httpx.Request("POST", url)
+                raise httpx.ConnectTimeout("tcp connect stalled", request=request)
+            return httpx.Response(200, json={"access_token": "fresh-access"})
+
+    server = TimeoutThenSuccess()
+    access, refresh = await GuangyaCredentialProvider().refresh_access(server, "refresh-secret")
+
+    assert access == "fresh-access"
+    assert refresh is None
+    assert server.calls == 2
+    assert all(timeout is not None for timeout in server.timeouts)
+
+
+@pytest.mark.asyncio
+async def test_final_refresh_timeout_reports_stage_and_keeps_network_category():
+    class AlwaysReadTimeout:
+        def __init__(self):
+            self.calls = 0
+
+        async def post(self, url, json, headers, **kwargs):
+            self.calls += 1
+            request = httpx.Request("POST", url)
+            raise httpx.ReadTimeout("server did not send response headers", request=request)
+
+    server = AlwaysReadTimeout()
+    with pytest.raises(GuangyaTransferError) as caught:
+        await GuangyaCredentialProvider().refresh_access(server, "refresh-secret-value")
+
+    assert server.calls == 2
+    assert caught.value.category == TransferErrorCategory.NETWORK_TIMEOUT
+    assert "endpoint_type=account" in str(caught.value)
+    assert "stage=RESPONSE_READ" in str(caught.value)
+    assert "elapsed_ms=" in str(caught.value)
+    assert "exception_type=ReadTimeout" in str(caught.value)
+    assert "server did not send response headers" in str(caught.value)
+    assert "refresh-secret-value" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_api_timeout_log_identifies_endpoint_and_redacts_query(caplog, monkeypatch):
+    import logging
+    from unittest.mock import AsyncMock
+
+    from app.transfer.adapters.guangya import GuangyaAdapter
+
+    adapter = GuangyaAdapter(write_enabled=False)
+    request = httpx.Request("POST", "https://api.guangyapan.com/file/list")
+    async with httpx.AsyncClient() as client:
+        monkeypatch.setattr(
+            client,
+            "post",
+            AsyncMock(side_effect=httpx.ReadTimeout("response read timed out", request=request)),
+        )
+        with caplog.at_level(logging.WARNING), pytest.raises(httpx.ReadTimeout):
+            await adapter.post(
+                client,
+                "https://api.guangyapan.com/file/list?share_token=never-log-this",
+                {},
+                {},
+            )
+
+    assert "endpoint_type=api" in caplog.text
+    assert "stage=RESPONSE_READ" in caplog.text
+    assert "exception_type=ReadTimeout" in caplog.text
+    assert "never-log-this" not in caplog.text

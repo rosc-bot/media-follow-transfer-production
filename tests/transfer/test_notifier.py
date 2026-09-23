@@ -38,7 +38,7 @@ async def test_notifier_success_pushes_to_source_channel():
         body = call_args[1]['json']
         assert body['chat_id'] == '@guangyazhauncun'
         assert '测试剧集' in body['text']
-        assert 'S01E01, S01E02' in body['text']
+        assert 'S01E01-E02（2集）' in body['text']
         assert '测试剧集.S01E01.mkv' in body['text']
 
 

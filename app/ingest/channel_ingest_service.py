@@ -26,6 +26,7 @@ from app.models.watchlist import SeriesWatchlist
 from app.schemas.telegram_source import TelegramSourceMessage
 from app.transfer.normalization import share_hash
 from app.transfer.queue_service import TransferQueueService
+from app.transfer.status import REVIEW_STATUS
 
 
 class ChannelIngestService:
@@ -103,6 +104,41 @@ class ChannelIngestService:
                         'deduplicated': True,
                         'queue_reused': True,
                         'transfer_status': existing.transfer_status,
+                        'preflight_classification': (reuse_task.payload or {}).get('preflight_classification'),
+                        'queued_reactivated': bool((reuse_task.payload or {}).get('queued_reactivated')),
+                        'candidate_switched': bool((reuse_task.payload or {}).get('candidate_switched')),
+                        'stale_pending_recovered': bool((reuse_task.payload or {}).get('stale_pending_recovered')),
+                    }
+                pending_tasks = list((await db.scalars(
+                    select(TransferQueueTask).where(
+                        TransferQueueTask.resource_id.in_(source_resources),
+                        TransferQueueTask.status == REVIEW_STATUS,
+                    )
+                )).all())
+                review_task = next((
+                    task for task in pending_tasks
+                    if target_episodes.intersection(canonical_episode_keys(
+                        (task.payload or {}).get('episode_keys') or [], season=existing.season,
+                    ))
+                ), None)
+                if review_task is not None:
+                    review_payload = dict(review_task.payload or {})
+                    return {
+                        'job_id': existing.id,
+                        'resource_id': review_task.resource_id,
+                        'queue_task_id': review_task.id,
+                        'existing_task_id': review_task.id,
+                        'status': INGEST_NEEDS_REVIEW,
+                        'is_forward': existing.is_forward,
+                        'queued': False,
+                        'deduplicated': False,
+                        'queue_reused': False,
+                        'transfer_status': REVIEW_STATUS,
+                        'preflight_classification': review_payload.get('preflight_classification') or 'NEEDS_REVIEW',
+                        'preflight_reason': review_payload.get('preflight_reason'),
+                        'queued_reactivated': bool(review_payload.get('queued_reactivated')),
+                        'candidate_switched': bool(review_payload.get('candidate_switched')),
+                        'stale_pending_recovered': bool(review_payload.get('stale_pending_recovered')),
                     }
                 return {
                     'job_id': existing.id,
@@ -235,6 +271,7 @@ class ChannelIngestService:
         job.status = INGEST_COMPLETED; job.identity_status = 'IDENTIFIED'; job.ready_for_transfer = True
         job.transfer_status = 'QUEUED' if decision.auto_transfer else 'MANUAL'
         queue_task_id = None
+        candidate_switched = False
         if decision.auto_transfer:
             enqueue_result = await TransferQueueService.enqueue_with_result(
                 db,
@@ -254,9 +291,34 @@ class ChannelIngestService:
                     'source_message_id': source_msg.message_id,
                     'is_forward': source_msg.is_forward,
                     'notification_chat_id': source_msg.metadata.get('notification_chat_id'),
+                    **({'selection_mode': 'MISSING_EPISODES'} if len(episodes) > 1 else {}),
                 },
             )
             queue_task_id = enqueue_result.task.id
+            if enqueue_result.created:
+                stale_rows = list((await db.execute(
+                    select(TransferQueueTask, Resource)
+                    .join(Resource, Resource.id == TransferQueueTask.resource_id)
+                    .where(
+                        TransferQueueTask.status == REVIEW_STATUS,
+                        Resource.tmdb_id == int(tmdb_id),
+                        Resource.season == int(season or 1),
+                    )
+                )).all())
+                target_keys = set(canonical_episode_keys(episodes, season=season))
+                for stale_task, stale_resource in stale_rows:
+                    old_payload = dict(stale_task.payload or {})
+                    old_keys = set(canonical_episode_keys(
+                        old_payload.get('episode_keys') or ([stale_resource.episode_key] if stale_resource.episode_key else []),
+                        season=season,
+                    ))
+                    if (
+                        target_keys.intersection(old_keys)
+                        and stale_resource.share_url
+                        and share_hash(stale_resource.share_url) != digest
+                    ):
+                        candidate_switched = True
+                        break
             if enqueue_result.deduplicated:
                 job.ready_for_transfer = False
                 job.transfer_status = 'SKIPPED_DUPLICATE'
@@ -283,7 +345,30 @@ class ChannelIngestService:
                     'existing_task_id': enqueue_result.task.id,
                     'queue_task_id': enqueue_result.task.id,
                     'is_forward': source_msg.is_forward,
+                    'preflight_classification': (enqueue_result.task.payload or {}).get('preflight_classification'),
+                    'queued_reactivated': bool((enqueue_result.task.payload or {}).get('queued_reactivated')),
+                    'candidate_switched': bool((enqueue_result.task.payload or {}).get('candidate_switched')),
+                    'stale_pending_recovered': bool((enqueue_result.task.payload or {}).get('stale_pending_recovered')),
+                }
+            if str(enqueue_result.task.status) == REVIEW_STATUS:
+                job.status = INGEST_NEEDS_REVIEW
+                job.ready_for_transfer = False
+                job.transfer_status = REVIEW_STATUS
+                job.error_message = 'existing review task requires a new candidate or cloud-state change'
+                await db.flush()
+                return {
+                    'job_id': job.id,
+                    'resource_id': resource.id,
+                    'status': INGEST_NEEDS_REVIEW,
+                    'queued': False,
+                    'deduplicated': False,
+                    'queue_reused': False,
+                    'existing_task_id': enqueue_result.task.id,
+                    'queue_task_id': enqueue_result.task.id,
+                    'preflight_classification': 'NEEDS_REVIEW',
+                    'preflight_reason': 'EXISTING_PENDING_REQUIRES_NEW_EVIDENCE',
+                    'is_forward': source_msg.is_forward,
                 }
         await db.flush()
         return {'job_id': job.id, 'resource_id': resource.id, 'queue_task_id': queue_task_id, 'status': job.status,
-                'queued': decision.auto_transfer, 'is_forward': job.is_forward}
+                'queued': decision.auto_transfer, 'candidate_switched': candidate_switched, 'is_forward': job.is_forward}

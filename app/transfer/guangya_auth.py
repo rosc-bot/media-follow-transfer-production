@@ -18,11 +18,16 @@ readback all share the exact same 401 -> single refresh -> retry path.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import re
+import socket
+import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from sqlalchemy import select, update
@@ -39,6 +44,35 @@ logger = logging.getLogger(__name__)
 ACCOUNT_BASE = 'https://account.guangyapan.com'
 REFRESH_PATH = '/v1/auth/token'
 CLIENT_ID = 'aMe-8VSlkrbQXpUR'
+REFRESH_REQUEST_TIMEOUT = httpx.Timeout(12.0, connect=5.0, read=8.0, write=5.0, pool=2.0)
+REFRESH_DNS_TIMEOUT_SECONDS = 4.0
+REFRESH_MAX_ATTEMPTS = 2
+REFRESH_RETRY_BACKOFF_SECONDS = 0.25
+_SENSITIVE_ERROR_RE = re.compile(
+    r'(?i)\b(access[_-]?token|refresh[_-]?token|authorization|cookie|auth_ref|password|secret|api[_-]?key)\b(\s*[:=]\s*)[^\s,;]+'
+)
+_ERROR_QUERY_RE = re.compile(r'(https?://[^\s?#]+)\?[^\s#]+')
+_BEARER_ERROR_RE = re.compile(r'(?i)\bBearer\s+[^\s,;]+')
+
+
+def _safe_exception_message(exc: BaseException) -> str:
+    message = str(exc)
+    message = _ERROR_QUERY_RE.sub(r'\1?[REDACTED_QUERY]', message)
+    message = _SENSITIVE_ERROR_RE.sub(r'\1\2[REDACTED]', message)
+    return _BEARER_ERROR_RE.sub('Bearer [REDACTED]', message)[:400]
+
+
+def _trace_stage(event_name: str) -> str | None:
+    lowered = str(event_name).casefold()
+    if 'start_tls' in lowered:
+        return 'TLS_HANDSHAKE'
+    if 'connect_tcp' in lowered:
+        return 'TCP_CONNECT'
+    if 'send_request_headers' in lowered or 'send_request_body' in lowered:
+        return 'REQUEST_WRITE'
+    if 'receive_response_headers' in lowered or 'receive_response_body' in lowered:
+        return 'RESPONSE_READ'
+    return None
 
 
 def default_device_id() -> str:
@@ -189,6 +223,90 @@ class GuangyaCredentialProvider:
             headers['authorization'] = f'Bearer {access_token}'
         return headers
 
+    async def _request_refresh(
+        self,
+        client: httpx.AsyncClient,
+        refresh_token: str,
+    ) -> httpx.Response:
+        """Perform a bounded account refresh and retain the failing transport stage."""
+        url = f'{ACCOUNT_BASE}{REFRESH_PATH}'
+        response: httpx.Response | None = None
+        for attempt in range(1, REFRESH_MAX_ATTEMPTS + 1):
+            started = time.monotonic()
+            stage = 'DNS_RESOLUTION'
+            trace_state = {'stage': ''}
+
+            async def trace(event_name: str, _info: dict[str, Any], _state=trace_state) -> None:
+                if str(event_name).endswith('.started'):
+                    traced_stage = _trace_stage(event_name)
+                    if traced_stage:
+                        _state['stage'] = traced_stage
+
+            try:
+                if isinstance(client, httpx.AsyncClient):
+                    host = urlsplit(url).hostname
+                    if host:
+                        await asyncio.wait_for(
+                            asyncio.get_running_loop().getaddrinfo(host, 443, type=socket.SOCK_STREAM),
+                            timeout=REFRESH_DNS_TIMEOUT_SECONDS,
+                        )
+                stage = 'TCP_CONNECT'
+                response = await client.post(
+                    url,
+                    json={
+                        'client_id': self.client_id,
+                        'grant_type': 'refresh_token',
+                        'refresh_token': refresh_token,
+                    },
+                    headers=self._account_headers(),
+                    timeout=REFRESH_REQUEST_TIMEOUT,
+                    extensions={'trace': trace},
+                )
+                break
+            except (httpx.TimeoutException, TimeoutError, httpx.NetworkError, OSError) as exc:
+                if isinstance(exc, httpx.PoolTimeout):
+                    stage = 'CONNECTION_POOL_WAIT'
+                elif isinstance(exc, httpx.WriteTimeout):
+                    stage = 'REQUEST_WRITE'
+                elif isinstance(exc, httpx.ReadTimeout):
+                    stage = 'RESPONSE_READ'
+                elif trace_state['stage']:
+                    stage = trace_state['stage']
+                elif isinstance(exc, TimeoutError) and stage == 'DNS_RESOLUTION':
+                    stage = 'DNS_TIMEOUT'
+                elif isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError)):
+                    stage = 'TCP_CONNECT'
+                elapsed_ms = round((time.monotonic() - started) * 1000)
+                exception_message = _safe_exception_message(exc)
+                category = (
+                    TransferErrorCategory.NETWORK_TIMEOUT
+                    if isinstance(exc, (httpx.TimeoutException, TimeoutError))
+                    else TransferErrorCategory.NETWORK_ERROR
+                )
+                logger.warning(
+                    'Guangya request failed endpoint_type=account stage=%s elapsed_ms=%s exception_type=%s exception_message=%s attempt=%s/%s',
+                    stage,
+                    elapsed_ms,
+                    type(exc).__name__,
+                    exception_message,
+                    attempt,
+                    REFRESH_MAX_ATTEMPTS,
+                )
+                if attempt < REFRESH_MAX_ATTEMPTS:
+                    await asyncio.sleep(REFRESH_RETRY_BACKOFF_SECONDS)
+                    continue
+                raise GuangyaTransferError(
+                    category,
+                    f'guangya refresh failed endpoint_type=account stage={stage} elapsed_ms={elapsed_ms} '
+                    f'exception_type={type(exc).__name__} exception_message={exception_message}',
+                ) from exc
+        if response is None:
+            raise GuangyaTransferError(
+                TransferErrorCategory.NETWORK_ERROR,
+                'guangya refresh failed endpoint_type=account stage=UNKNOWN response_missing=true',
+            )
+        return response
+
     async def refresh_access(self, client: httpx.AsyncClient, refresh_token: str) -> tuple[str, str | None]:
         """Exchange *refresh_token* for a fresh access token.
 
@@ -199,20 +317,7 @@ class GuangyaCredentialProvider:
         AUTH_INVALID (400/401/403 or malformed body), RATE_LIMITED (429),
         REMOTE_5XX (5xx), NETWORK_TIMEOUT / NETWORK_ERROR for transport faults.
         """
-        try:
-            response = await client.post(
-                f'{ACCOUNT_BASE}{REFRESH_PATH}',
-                json={
-                    'client_id': self.client_id,
-                    'grant_type': 'refresh_token',
-                    'refresh_token': refresh_token,
-                },
-                headers=self._account_headers(),
-            )
-        except httpx.TimeoutException as exc:
-            raise GuangyaTransferError(TransferErrorCategory.NETWORK_TIMEOUT, 'guangya refresh timed out') from exc
-        except httpx.HTTPError as exc:
-            raise GuangyaTransferError(TransferErrorCategory.NETWORK_ERROR, 'guangya refresh network error') from exc
+        response = await self._request_refresh(client, refresh_token)
 
         status = response.status_code
         if status == 200:

@@ -95,7 +95,7 @@ async def test_success_card_is_rich_and_uses_send_photo_with_fixed_success_route
     }
     result = {"verified": True, "remote_files": ["S01E02-Gyy.mkv"], "selected_file_sizes": {"S01E02-Gyy.mkv": 348400000}}
     card = build_success_card(task_payload=payload, transfer_result=result)
-    for text in ("测试剧", "分享链接", "已完结", "收录集数", "规格版本", "资源体积", "归档目录", "智能去重", "@source_user"):
+    for text in ("测试剧", "分享链接", "已完结", "收录状态待校验", "本次新增", "规格版本", "资源体积", "归档目录", "智能去重", "@source_user"):
         assert text in card.caption
     assert card.poster_url.endswith("poster.jpg")
     assert "Task" not in card.caption

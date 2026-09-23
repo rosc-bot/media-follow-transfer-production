@@ -6,6 +6,7 @@ separately gated in ``tools.run_transfer_canary``.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -66,7 +67,8 @@ def _episode_numbers(keys: list[str]) -> set[int]:
 
 
 async def validate_remote_canary(
-    *, provider: str, share_url: str, auth_ref: str, target_folder_id: str, episode_keys: list[str], season: int | None = None
+    *, provider: str, share_url: str, auth_ref: str, target_folder_id: str, episode_keys: list[str],
+    season: int | None = None, selection_mode: str | None = None, share_override: dict | None = None,
 ) -> dict:
     """Run public-share and account-directory reads separately; no writes."""
     if provider != "guangya":
@@ -86,7 +88,7 @@ async def validate_remote_canary(
 
     adapter = GuangyaAdapter(write_enabled=False)
     probe = GuangyaShareProbe(adapter=adapter)
-    share = await probe.probe(share_url)
+    share = dict(share_override) if isinstance(share_override, dict) else await probe.probe(share_url)
     result: dict[str, Any] = {
         "share_accessible": bool(share["share_accessible"]),
         "has_video": False,
@@ -114,6 +116,7 @@ async def validate_remote_canary(
         try:
             selection = select_files(
                 list(share.get("video_files") or []),
+                selection_mode=selection_mode,
                 episode_keys=[str(key) for key in episode_keys],
                 season=season,
             )
@@ -121,11 +124,15 @@ async def validate_remote_canary(
             result["selection_mode"] = selection.selection_mode.value
             result["selected_file_ids"] = list(selection.selected_file_ids)
             result["selected_file_names"] = list(selection.selected_file_names)
+            result["selected_episode_keys"] = list(selection.selected_episode_keys)
+            result["episode_file_map"] = dict(selection.episode_file_map)
             result["raw_listing_count"] = selection.raw_listing_count
             result["unique_video_count"] = selection.unique_video_count
             result["matched_listing_count"] = selection.matched_listing_count
             result["matched_unique_file_count"] = selection.matched_unique_file_count
-            result["episode_match"] = selection.decision == "EXACT_SINGLE_EPISODE"
+            result["episode_match"] = selection.decision in {
+                "EXACT_SINGLE_EPISODE", "MISSING_EPISODES", "WHOLE_SHARE", "COLLECTION",
+            }
             if not result["has_video"]:
                 result["failure_code"] = "NO_VIDEO"
                 result["failure_detail"] = "share read succeeded but contains no supported video file"
@@ -135,19 +142,24 @@ async def validate_remote_canary(
             elif selection.decision == "FILE_SELECTION_REVIEW":
                 result["failure_code"] = "FILE_SELECTION_REVIEW"
                 result["failure_detail"] = "multiple unique regular video files match target episode"
-            elif selection.decision != "EXACT_SINGLE_EPISODE":
+            elif selection.decision not in {"EXACT_SINGLE_EPISODE", "MISSING_EPISODES", "WHOLE_SHARE", "COLLECTION"}:
                 result["failure_code"] = selection.decision
                 result["failure_detail"] = f"selection decision={selection.decision}"
         except FileSelectionError as exc:
             result["failure_code"] = exc.code
             result["failure_detail"] = str(exc)
-    try:
-        await adapter.list_directories(auth_token=auth_ref, parent_id=target_folder_id)
-        result["destination_auth"] = True
-        result["destination_read"] = True
-    except Exception as exc:  # noqa: BLE001 - remote account verification is diagnostic/fail-closed
-        result["failure_code"] = result["failure_code"] or "ACCOUNT_AUTH_FAILED"
-        result["failure_detail"] = result["failure_detail"] or f"{type(exc).__name__}: {str(exc)[:240]}"
+    for _attempt in range(3):
+        try:
+            await adapter.list_directories(auth_token=auth_ref, parent_id=target_folder_id)
+            result["destination_auth"] = True
+            result["destination_read"] = True
+            break
+        except Exception as exc:  # noqa: BLE001 - remote account verification is diagnostic/fail-closed
+            if _attempt == 2:
+                result["failure_code"] = result["failure_code"] or "ACCOUNT_AUTH_FAILED"
+                result["failure_detail"] = result["failure_detail"] or f"{type(exc).__name__}: {str(exc)[:240]}"
+            else:
+                await asyncio.sleep(1.0)
     return result
 
 
@@ -157,6 +169,8 @@ async def preflight_task(
     *,
     remote_validator: Callable[..., Awaitable[dict]] | None = None,
     allow_running_locked_by: str | None = None,
+    episode_keys_override: list[str] | None = None,
+    selection_mode_override: str | None = None,
 ) -> dict:
     """Produce a fully expanded read-only report for one historical task."""
     checks = CheckReport({
@@ -208,7 +222,11 @@ async def preflight_task(
     report["title"] = payload.get("title") or (resource.title if resource else None)
     report["tmdb_id"] = payload.get("tmdb_id") or (resource.tmdb_id if resource else None)
     report["season"] = payload.get("season") or (resource.season if resource else None)
-    episode_keys = list(payload.get("episode_keys") or ([resource.episode_key] if resource and resource.episode_key else []))
+    episode_keys = list(
+        episode_keys_override
+        if episode_keys_override is not None
+        else payload.get("episode_keys") or ([resource.episode_key] if resource and resource.episode_key else [])
+    )
     report["episode_key"] = episode_keys[0] if len(episode_keys) == 1 else episode_keys
     tmdb_id, season = report["tmdb_id"], report["season"]
     share_url = payload.get("share_url") or (resource.share_url if resource else None)
@@ -351,6 +369,7 @@ async def preflight_task(
                 provider=provider, share_url=str(share_url), auth_ref=str(cloud_cfg.auth_ref),
                 target_folder_id=str(cloud_cfg.target_folder_id or cloud_cfg.ongoing_target_folder_id),
                 episode_keys=[str(key) for key in episode_keys], season=int(season) if season else None,
+                selection_mode=selection_mode_override or payload.get("selection_mode"),
             )
             remote = {
                 **remote,

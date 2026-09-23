@@ -22,14 +22,9 @@ from app.models.watchlist import SeriesWatchlist
 from app.transfer.destination_routing import DestinationRouter
 from app.transfer.normalization import build_idempotency_key
 from app.transfer.queue_service import TransferQueueService
-from app.transfer.status import TransferStatus
+from app.transfer.status import EXECUTION_ACTIVE_STATUSES
 
-_ACTIVE_TRANSFER_STATUSES = frozenset({
-    str(TransferStatus.QUEUED),
-    str(TransferStatus.RETRY_WAIT),
-    str(TransferStatus.RUNNING),
-    "PENDING",
-})
+_ACTIVE_TRANSFER_STATUSES = EXECUTION_ACTIVE_STATUSES
 
 
 class CompletionPromotionService:

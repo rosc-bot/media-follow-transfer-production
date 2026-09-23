@@ -95,11 +95,36 @@ def _format_size(size_bytes: int) -> str:
 
 
 def _episode_display(payload: dict[str, Any], names: tuple[str, ...]) -> tuple[str, int]:
-    raw = payload.get("episode_keys") or []
+    raw = payload.get("selected_episode_keys") or payload.get("episode_keys") or []
     keys = [str(value).strip() for value in raw if str(value).strip()]
     if not keys:
         keys = [str(value).strip() for value in names if str(value).strip()]
     return ", ".join(keys) if keys else "本次入库", len(keys)
+
+
+def _format_episode_ranges(values: Any) -> str:
+    parsed: dict[int, set[int]] = {}
+    for value in values:
+        match = re.fullmatch(r"S(\d{1,3})E(\d{1,4})", str(value).strip(), re.IGNORECASE)
+        if match:
+            parsed.setdefault(int(match.group(1)), set()).add(int(match.group(2)))
+    parts: list[str] = []
+    for season in sorted(parsed):
+        numbers = sorted(parsed[season])
+        if not numbers:
+            continue
+        start = previous = numbers[0]
+        for number in numbers[1:] + [None]:
+            if number is not None and number == previous + 1:
+                previous = number
+                continue
+            if start == previous:
+                parts.append(f"S{season:02d}E{start:02d}")
+            else:
+                parts.append(f"S{season:02d}E{start:02d}-E{previous:02d}")
+            if number is not None:
+                start = previous = number
+    return "、".join(parts) if parts else "—"
 
 
 def _business_status(payload: dict[str, Any], transfer_result: dict[str, Any]) -> str:
@@ -286,11 +311,44 @@ def build_success_card(*, task_payload: dict[str, Any], transfer_result: dict[st
     region = html.escape(str(task_payload.get("region") or task_payload.get("country") or "未知"))
     media_type = "电影" if str(task_payload.get("media_type") or "tv").casefold() in {"movie", "电影"} else "剧集"
     episode_text, episode_count = _episode_display(task_payload, names)
-    total = task_payload.get("total_episodes")
-    count_text = f"{episode_text}（本次 {episode_count} 集"
-    if total:
-        count_text += f"，共 {int(total)} 集"
-    count_text += "）"
+    selected_episode_keys = (
+        transfer_result.get("selected_episode_keys")
+        or task_payload.get("selected_episode_keys")
+        or task_payload.get("episode_keys")
+        or []
+    )
+    new_episode_text = _format_episode_ranges(selected_episode_keys) or episode_text
+    if episode_count > 1:
+        new_episode_text = f"{new_episode_text}（{episode_count}集）"
+    try:
+        season_number = int(task_payload.get("season") or 0)
+        total = int(task_payload.get("total_episodes") or 0)
+    except (TypeError, ValueError):
+        season_number = total = 0
+    collected_keys: set[str] = set()
+    for value in task_payload.get("collected_episode_keys") or task_payload.get("collected_episodes") or []:
+        match = re.fullmatch(r"S(\d{1,3})E(\d{1,4})", str(value).strip(), re.IGNORECASE)
+        if match and (not season_number or int(match.group(1)) == season_number):
+            collected_keys.add(f"S{int(match.group(1)):02d}E{int(match.group(2)):02d}")
+    if media_type == "电影":
+        progress_lines = "📦 <b>收录进度：</b>本次已入库\n"
+    elif task_payload.get("collection_progress_verified") and season_number > 0 and total > 0:
+        expected_keys = {f"S{season_number:02d}E{episode:02d}" for episode in range(1, total + 1)}
+        missing_keys = task_payload.get("missing_episode_keys")
+        if missing_keys is None:
+            missing_keys = sorted(expected_keys - collected_keys)
+        else:
+            missing_keys = list(missing_keys)
+        progress_lines = f"📦 <b>收录进度：</b>S{season_number:02d} 已收录 {len(collected_keys)} / {total}\n"
+        if missing_keys:
+            progress_lines += f"❌ <b>当前缺集：</b>{html.escape(_format_episode_ranges(missing_keys))}\n"
+        else:
+            progress_lines += f"✅ <b>本季已收齐：</b>{total}/{total}\n"
+    else:
+        progress_lines = "⚠️ <b>收录状态待校验</b>\n"
+    new_episode_line = f"🆕 <b>本次新增：</b>{html.escape(new_episode_text)}\n"
+    verified_episode_files = transfer_result.get("verified_episode_files") or []
+    verification_count = len(verified_episode_files) if verified_episode_files else len(names)
     business_status = _business_status(task_payload, transfer_result)
     share_url = sanitize_share_url(task_payload.get("share_url") or task_payload.get("candidate_share_url"))
     share_line = f'<a href="{html.escape(share_url, quote=True)}">{html.escape(share_url)}</a>' if share_url else "未提供可用分享链接"
@@ -300,7 +358,8 @@ def build_success_card(*, task_payload: dict[str, Any], transfer_result: dict[st
         f"📌 <b>地区：</b>{region}\n"
         f"📀 <b>类型：</b>{media_type}\n"
         f"📊 <b>状态：</b>{html.escape(business_status)}\n"
-        f"📦 <b>收录集数：</b>{html.escape(count_text)}\n"
+        f"{progress_lines}"
+        f"{new_episode_line}"
         f"🎞 <b>规格版本：</b>{html.escape(_specification(task_payload, names))}\n"
         f"💾 <b>资源体积：</b>{html.escape(_format_size(total_size))}\n"
         "☁️ <b>资源网盘：</b>#光鸭\n"
@@ -309,7 +368,7 @@ def build_success_card(*, task_payload: dict[str, Any], transfer_result: dict[st
         f"📄 <b>已核验文件：</b>{html.escape(', '.join(names) or '—')}\n"
         f"✨ <b>智能去重：</b>✅ 转存成功（已确认 {len(names)} 个文件入库）\n"
         f"👤 <b>感谢贡献：</b>{html.escape(_contributor(task_payload))}\n"
-        "✅ <b>入库验证：</b>已通过"
+        f"✅ <b>入库验证：</b>本次已核验 {verification_count} 个文件"
     )
     poster = _poster_url(task_payload)
     return SuccessCard(

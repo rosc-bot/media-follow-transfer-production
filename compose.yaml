@@ -28,7 +28,10 @@ services:
         condition: service_healthy
 
   api:
-    build: .
+    build:
+      context: .
+      args:
+        RELEASE_COMMIT: ${RELEASE_COMMIT:-unknown}
     restart: unless-stopped
     env_file: .env
     environment:
@@ -39,7 +42,10 @@ services:
         condition: service_completed_successfully
 
   bot:
-    build: .
+    build:
+      context: .
+      args:
+        RELEASE_COMMIT: ${RELEASE_COMMIT:-unknown}
     restart: unless-stopped
     env_file: .env
     environment:
@@ -50,7 +56,10 @@ services:
         condition: service_completed_successfully
 
   follow-worker:
-    build: .
+    build:
+      context: .
+      args:
+        RELEASE_COMMIT: ${RELEASE_COMMIT:-unknown}
     restart: unless-stopped
     env_file: .env
     environment:
@@ -76,7 +85,10 @@ services:
       - ./data:/app/data
 
   transfer-worker:
-    build: .
+    build:
+      context: .
+      args:
+        RELEASE_COMMIT: ${RELEASE_COMMIT:-unknown}
     restart: unless-stopped
     env_file: .env
     environment:

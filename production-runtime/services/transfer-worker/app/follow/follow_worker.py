@@ -163,7 +163,9 @@ async def run_follow_cycle(
     logger.info(
         'Follow cycle complete: synced %d watchlists, discovered %d legacy roots, queued %d promotions, scouted %d jobs '
         '(targets=%d local_hit=%d local_miss=%d framehdr_attempted=%d framehdr_hit=%d framehdr_miss=%d '
-        'transfer_eligible=%d new_queue_tasks_created=%d deduplicated_existing_tasks=%d queue_reused=%d needs_review=%d)',
+        'transfer_eligible=%d new_queue_tasks_created=%d deduplicated_existing_tasks=%d queue_reused=%d needs_review=%d '
+        'missing_total=%d missing_with_local_candidate=%d missing_with_framehdr_candidate=%d auto_safe=%d '
+        'pending_review=%d no_resource=%d queued_new=%d queued_reactivated=%d candidate_switched=%d stale_pending_recovered=%d)',
         synced,
         discovered,
         promotions,
@@ -179,6 +181,16 @@ async def run_follow_cycle(
         cycle_stats.get('deduplicated_existing_tasks', 0),
         cycle_stats.get('queue_reused', 0),
         cycle_stats.get('needs_review', 0),
+        cycle_stats.get('missing_total', 0),
+        cycle_stats.get('missing_with_local_candidate', 0),
+        cycle_stats.get('missing_with_framehdr_candidate', 0),
+        cycle_stats.get('auto_safe', 0),
+        cycle_stats.get('pending_review', 0),
+        cycle_stats.get('no_resource', 0),
+        cycle_stats.get('queued_new', 0),
+        cycle_stats.get('queued_reactivated', 0),
+        cycle_stats.get('candidate_switched', 0),
+        cycle_stats.get('stale_pending_recovered', 0),
     )
     return {'synced_watchlists': synced, 'scout_jobs': scout_jobs, 'cycle_stats': cycle_stats}
 

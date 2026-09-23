@@ -348,10 +348,17 @@ def build_rename_plan(
     cloud_count: int | None = None,
     active_transfer_count: int | None = None,
     aliases: list[str] | None = None,
+    episode_keys_by_file_id: dict[str, str] | None = None,
 ) -> RenamePlan:
     """Plan a conditional rename only for selected files in verified readback."""
 
     del version_key  # retained in the call contract for queue compatibility
+    aliases = list(aliases or [])
+    episode_keys_by_file_id = {
+        str(file_id).strip(): str(key).strip()
+        for file_id, key in (episode_keys_by_file_id or {}).items()
+        if str(file_id).strip() and str(key).strip()
+    }
     selected = {str(value).strip() for value in selected_file_ids if str(value).strip()}
     raw_records = [
         {"file_id": _record_id(record), "name": _record_name(record)}
@@ -420,7 +427,7 @@ def build_rename_plan(
                 year=year,
                 tmdb_id=tmdb_id,
                 season=season,
-                episode_key=episode_key,
+                episode_key=episode_keys_by_file_id.get(record["file_id"]) or episode_key,
                 source_filename=old_name,
             )
         selected_targets[record["file_id"]] = target

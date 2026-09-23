@@ -1,6 +1,10 @@
 .git
 .env
-data/*.db
-data/*.session
+data/
+backups/
+production-runtime/
+spec/
+tests/
 __pycache__
 .pytest_cache
+*.pyc

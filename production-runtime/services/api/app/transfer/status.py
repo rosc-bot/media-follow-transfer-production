@@ -15,6 +15,14 @@ class TransferStatus(StrEnum):
     SKIPPED = 'SKIPPED'
 
 
+EXECUTION_ACTIVE_STATUSES = frozenset({
+    str(TransferStatus.QUEUED),
+    str(TransferStatus.RUNNING),
+    str(TransferStatus.RETRY_WAIT),
+})
+REVIEW_STATUS = 'PENDING'
+
+
 SUCCESS_TERMINAL_STATUSES = frozenset({
     TransferStatus.SUCCESS,
     TransferStatus.COMPLETED,
@@ -38,3 +46,4 @@ class TransferOutcome:
     remote_file_records: tuple[dict, ...] = ()
     rename_status: str | None = None
     promotion_status: str | None = None
+    verified_episode_files: tuple[dict, ...] = ()

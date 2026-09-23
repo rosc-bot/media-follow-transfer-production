@@ -5,6 +5,7 @@ The probe never invokes restore, directory creation, move, rename or deletion.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -48,23 +49,32 @@ class GuangyaShareProbe:
 
     async def probe(self, share_url: str) -> dict:
         """Read and classify exactly one public share; never persist or mutate it."""
-        try:
-            raw = await self.adapter.inspect_share(
-                share_url=share_url,
-                max_depth=self.max_depth,
-                max_items=self.max_items,
-                max_pages=self.max_pages,
-            )
-        except TypeError:
-            # Compatibility with mocked/pre-Phase2E adapters, still read-only.
+        for _attempt in range(3):
             try:
-                raw = await self.adapter.inspect_share(share_url=share_url)
+                raw = await self.adapter.inspect_share(
+                    share_url=share_url,
+                    max_depth=self.max_depth,
+                    max_items=self.max_items,
+                    max_pages=self.max_pages,
+                )
+                break
+            except TypeError:
+                # Compatibility with mocked/pre-Phase2E adapters, still read-only.
+                try:
+                    raw = await self.adapter.inspect_share(share_url=share_url)
+                    break
+                except Exception as exc:  # noqa: BLE001 - classification must fail closed
+                    if _attempt < 2:
+                        await asyncio.sleep(1.0)
+                        continue
+                    code, deterministic = self._error_code(exc)
+                    return self._failure(code, exc, deterministic)
             except Exception as exc:  # noqa: BLE001 - classification must fail closed
+                if _attempt < 2:
+                    await asyncio.sleep(1.0)
+                    continue
                 code, deterministic = self._error_code(exc)
                 return self._failure(code, exc, deterministic)
-        except Exception as exc:  # noqa: BLE001 - classification must fail closed
-            code, deterministic = self._error_code(exc)
-            return self._failure(code, exc, deterministic)
 
         if not raw.get("share_accessible", raw.get("share_readable", False)):
             return self._failure(str(raw.get("error_code") or "INVALID_SHARE"), None, True, raw)

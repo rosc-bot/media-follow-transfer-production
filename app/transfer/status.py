@@ -15,6 +15,14 @@ class TransferStatus(StrEnum):
     SKIPPED = 'SKIPPED'
 
 
+EXECUTION_ACTIVE_STATUSES = frozenset({
+    str(TransferStatus.QUEUED),
+    str(TransferStatus.RUNNING),
+    str(TransferStatus.RETRY_WAIT),
+})
+REVIEW_STATUS = 'PENDING'
+
+
 SUCCESS_TERMINAL_STATUSES = frozenset({
     TransferStatus.SUCCESS,
     TransferStatus.COMPLETED,

@@ -33,6 +33,31 @@ class TMDBSeasonProvider:
             raise TypeError('TMDB season response is not an object')
         return payload
 
+    async def fetch_details(self, tmdb_id: int, media_type: str = 'tv') -> dict[str, Any]:
+        """Fetch the complete read-only TMDB identity used by the category router."""
+        if not self.api_key:
+            raise ValueError('TMDB_API_KEY is required for destination routing')
+        if tmdb_id <= 0:
+            raise ValueError('tmdb_id must be positive')
+        kind = 'movie' if str(media_type or 'tv').casefold() in {'movie', 'film', '电影'} else 'tv'
+        payload = await self.fetch_json(
+            f'{self.base_url}/{kind}/{tmdb_id}',
+            {'api_key': self.api_key, 'append_to_response': 'keywords'},
+        )
+        if not isinstance(payload, dict):
+            raise TypeError('TMDB details response is not an object')
+        result = dict(payload)
+        result['id'] = int(result.get('id') or tmdb_id)
+        result['media_type'] = kind
+        if not result.get('origin_country') and result.get('production_countries'):
+            result['origin_country'] = [
+                item.get('iso_3166_1')
+                for item in result.get('production_countries') or []
+                if isinstance(item, dict) and item.get('iso_3166_1')
+            ]
+        result['metadata_complete'] = bool(result.get('id') and result.get('original_language'))
+        return result
+
     async def fetch_schedule(self, tmdb_id: int, season: int) -> dict[str, Any]:
         if not self.api_key:
             raise ValueError('TMDB_API_KEY is required for TMDB schedule synchronization')

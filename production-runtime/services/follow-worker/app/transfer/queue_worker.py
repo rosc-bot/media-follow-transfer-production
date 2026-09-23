@@ -1,8 +1,11 @@
+import asyncio
 import logging
 import os
+import re
 import socket
 from datetime import UTC, datetime
 
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -20,21 +23,46 @@ from app.transfer.candidate_service import stable_share_key
 from app.transfer.canonical_destination import DestinationMetadataIncomplete
 from app.transfer.cloud_inventory_service import CloudInventoryService
 from app.transfer.destination_routing import DestinationRouter
-from app.transfer.errors import PromotionUnverifiedError, RenameUnverifiedError, classify_error
+from app.transfer.errors import (
+    PromotionUnverifiedError,
+    RenameUnverifiedError,
+    TransferErrorCategory,
+    classify_error,
+)
 from app.transfer.final_preflight import (
     AUTO_SAFE,
     build_source_rename_plan,
     classify_final_preflight,
 )
+from app.transfer.missing_episode_preflight import plan_missing_episode_transfer
 from app.transfer.notifier import NotificationResult, TransferNotifier
 from app.transfer.orchestrator import TransferOrchestrator
 from app.transfer.queue_service import TransferQueueService
-from app.transfer.status import TransferStatus
+from app.transfer.status import EXECUTION_ACTIVE_STATUSES, REVIEW_STATUS, TransferStatus
 from app.transfer.task_identity import task_matches_episode
 
 logger = logging.getLogger(__name__)
 
 _SERIES_MEDIA_TYPES = frozenset({'tv', 'anime', 'series', '电视剧', '动漫'})
+_ACTIVE_EPISODE_TASK_STATUSES = EXECUTION_ACTIVE_STATUSES
+BATCH_PREFLIGHT_TIMEOUT_SECONDS = 90.0
+_SENSITIVE_VALUE_RE = re.compile(
+    r'(?i)\b(access[_-]?token|refresh[_-]?token|authorization|cookie|auth_ref|password|secret|api[_-]?key)\b(\s*[:=]\s*)[^\s,;]+'
+)
+_BEARER_VALUE_RE = re.compile(r'(?i)\bBearer\s+[^\s,;]+')
+_URL_QUERY_RE = re.compile(r'(https?://[^\s?#]+)\?[^\s#]+')
+
+
+def _safe_preflight_detail(exc: BaseException) -> str:
+    message = str(exc)
+    message = _URL_QUERY_RE.sub(r'\1?[REDACTED_QUERY]', message)
+    message = _SENSITIVE_VALUE_RE.sub(r'\1\2[REDACTED]', message)
+    message = _BEARER_VALUE_RE.sub('Bearer [REDACTED]', message)
+    return f'{type(exc).__name__}: {message[:600]}'
+
+
+def _is_active_episode_task_status(status: object) -> bool:
+    return str(status or '').strip().upper() in _ACTIVE_EPISODE_TASK_STATUSES
 
 
 def _series_layout_names(resource: Resource, watchlist: SeriesWatchlist | None, destination_kind: str) -> tuple[str, str] | None:
@@ -55,6 +83,20 @@ def _series_layout_names(resource: Resource, watchlist: SeriesWatchlist | None, 
     if season < 1:
         raise RuntimeError('series transfer requires a positive season number')
     return series_name, f'S{season:02d}'
+
+
+def _metadata_relevant_seasons(metadata: dict, fallback_season: int) -> list[int]:
+    seasons: set[int] = set()
+    for item in metadata.get('seasons') or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            season = int(item.get('season_number') or 0)
+        except (TypeError, ValueError):
+            continue
+        if season > 0:
+            seasons.add(season)
+    return sorted(seasons) or [int(fallback_season)]
 
 
 class TransferQueueWorker:
@@ -145,8 +187,17 @@ class TransferQueueWorker:
 
     async def _load_tmdb_metadata(self, payload: dict, resource: Resource) -> dict:
         cached = payload.get('tmdb_metadata') or payload.get('tmdb_details')
+        media_kind = 'movie' if str(resource.media_type or 'tv').casefold() in {'movie', 'film', '电影'} else 'tv'
         if isinstance(cached, dict) and cached.get('id'):
-            return dict(cached)
+            cached_kind = str(cached.get('media_type') or media_kind).casefold()
+            cached_seasons = cached.get('seasons')
+            has_relevant_seasons = isinstance(cached_seasons, list) and any(
+                isinstance(item, dict) and str(item.get('season_number') or '').isdigit()
+                and int(item.get('season_number') or 0) > 0
+                for item in cached_seasons
+            )
+            if cached_kind == media_kind and (media_kind == 'movie' or has_relevant_seasons):
+                return dict(cached)
         if not resource.tmdb_id:
             raise DestinationMetadataIncomplete('tmdb_id is required before destination routing')
         settings = get_settings()
@@ -199,7 +250,18 @@ class TransferQueueWorker:
                 payload['season'] = resource.season
             if not payload.get('episode_keys') and resource.episode_key:
                 payload['episode_keys'] = [resource.episode_key]
-            if not payload.get('selection_mode') and payload.get('episode_keys'):
+            if str(resource.media_type or 'tv').casefold() in _SERIES_MEDIA_TYPES and not is_promotion:
+                selected_mode = str(payload.get('selection_mode') or '').strip().upper()
+                explicit_mode = bool(payload.get('selection_mode_explicit'))
+                authorized_whole = bool(payload.get('whole_share_authorized'))
+                if selected_mode == 'WHOLE_SHARE' and explicit_mode and authorized_whole:
+                    payload['selection_mode'] = 'WHOLE_SHARE'
+                elif selected_mode in {'SINGLE_EPISODE', 'COLLECTION'} and explicit_mode:
+                    payload['selection_mode'] = selected_mode
+                else:
+                    payload['selection_mode'] = 'MISSING_EPISODES'
+                    payload['selection_mode_source'] = 'AUTO_MISSING_EPISODE_RECONCILIATION'
+            elif not payload.get('selection_mode') and payload.get('episode_keys'):
                 payload['selection_mode'] = 'SINGLE_EPISODE'
 
         if provider not in ('dry-run', 'mock', 'test'):
@@ -241,6 +303,11 @@ class TransferQueueWorker:
                         payload['watchlist_subscriber_tg_id'] = watchlist.subscriber_tg_id
                 if resource.tmdb_id:
                     metadata = await self._load_tmdb_metadata(payload, resource)
+                    if str(resource.media_type or 'tv').casefold() in _SERIES_MEDIA_TYPES:
+                        authoritative_status = str(metadata.get('status') or '').strip()
+                        if authoritative_status:
+                            payload['tmdb_series_status'] = authoritative_status
+                            payload['series_status'] = authoritative_status
                     route = DestinationRouter.resolve(
                         resource=resource,
                         cloud_config=cloud_cfg,
@@ -265,6 +332,8 @@ class TransferQueueWorker:
                             'remote_rel_path_prefix': destination.inventory_prefix,
                             'archive_directory': destination.archive_directory,
                             'category_resolution': destination.resolution.as_dict(),
+                            'season_layout_mode': 'MULTI_SEASON' if destination.season_name else 'SINGLE_SEASON_FLAT',
+                            'relevant_seasons': _metadata_relevant_seasons(metadata, int(resource.season or 1)),
                         })
                     else:
                         layout = _series_layout_names(resource, watchlist, route.kind)
@@ -310,6 +379,11 @@ class TransferQueueWorker:
         ))).all())
         if len(watchlists) != 1:
             return 'REJECTED', f'WATCHLIST_MATCH_COUNT={len(watchlists)}'
+        if str(payload.get('selection_mode') or '').upper() == 'MISSING_EPISODES':
+            # Share-wide episode/presence reconciliation runs in the provider-aware
+            # runtime preflight after claim; the trigger episode may already be
+            # collected while other files in its share are still missing.
+            return None
         collected = {
             key for value in (watchlists[0].collected_episodes or [])
             if (key := canonical_episode_key(resource.season, value)) is not None
@@ -329,7 +403,7 @@ class TransferQueueWorker:
         occupied = sorted(episode_numbers & {int(row.episode) for row in inventory if row.episode is not None})
         if occupied:
             return 'REJECTED', f'ALREADY_IN_CLOUD={occupied}'
-        active_statuses = {str(TransferStatus.QUEUED), str(TransferStatus.RETRY_WAIT), str(TransferStatus.RUNNING)}
+        active_statuses = EXECUTION_ACTIVE_STATUSES
         tasks = list((await db.scalars(select(TransferQueueTask).where(TransferQueueTask.id != task.id))).all())
         resource_ids = {row.resource_id for row in tasks if row.resource_id is not None}
         related_resources = {
@@ -350,6 +424,432 @@ class TransferQueueWorker:
             if str(other.status) in active_statuses:
                 return 'NEEDS_REVIEW', f'DUPLICATE_ACTIVE_TASK={other.id}'
         return None
+
+    async def _reconcile_verified_cloud_presence(
+        self,
+        *,
+        tmdb_id: int,
+        season: int,
+        title: str,
+        watchlist_id: int,
+        series_root_id: str,
+        inventory_prefix: str | None,
+        metadata_reconcile: dict[str, list[str] | tuple[str, ...]],
+        cloud_files: list[dict],
+        provider: str,
+    ) -> dict[str, int]:
+        """Apply ledger-only repairs in a separate transaction from preflight."""
+        if not metadata_reconcile:
+            return {"inventory_added": 0, "inventory_updated": 0, "collected_added": 0}
+        by_episode: dict[str, list[dict]] = {}
+        for record in cloud_files:
+            key = str(record.get("episode_key") or "").strip().upper()
+            if key:
+                by_episode.setdefault(key, []).append(record)
+        evidence: dict[str, dict] = {}
+        for key in metadata_reconcile:
+            records = by_episode.get(key, [])
+            if len(records) != 1:
+                raise RuntimeError(f"verified cloud evidence is not unique for {key}")
+            evidence[key] = records[0]
+
+        inventory_added = 0
+        inventory_updated = 0
+        collected_added = 0
+        async with self.session_factory() as reconcile_db, reconcile_db.begin():
+            watchlist = await reconcile_db.scalar(
+                select(SeriesWatchlist)
+                .where(SeriesWatchlist.id == int(watchlist_id))
+                .with_for_update()
+            )
+            if watchlist is None:
+                raise RuntimeError("watchlist disappeared during cloud metadata reconciliation")
+            for key, ledgers in metadata_reconcile.items():
+                record = evidence[key]
+                file_name = str(record.get("name") or "").strip()
+                cloud_path = str(record.get("path") or file_name).strip("/")
+                rel_path = "/".join(
+                    part for part in (str(inventory_prefix or "").strip("/"), cloud_path) if part
+                ) or None
+                if "inventory" in ledgers:
+                    result = await CloudInventoryService.upsert_verified_transfer(
+                        reconcile_db,
+                        tmdb_id=int(tmdb_id),
+                        title=title,
+                        season=int(season),
+                        episode_key=key,
+                        file_name=file_name,
+                        verified=True,
+                        rel_path=rel_path,
+                        remote_file_id=str(record.get("file_id") or "") or None,
+                        remote_folder_id=str(series_root_id or "") or None,
+                        provider=provider,
+                        source="verified_cloud_preflight_reconcile",
+                        scanned_at=datetime.now(UTC),
+                    )
+                    inventory_added += int(result.status == "INSERTED")
+                    inventory_updated += int(result.status == "UPDATED")
+                    if not result.persisted:
+                        raise RuntimeError(f"verified inventory reconciliation refused for {key}: {result.reason}")
+                if "collected" in ledgers:
+                    current = list(watchlist.collected_episodes or [])
+                    canonical = {
+                        value
+                        for raw in current
+                        if (value := canonical_episode_key(int(season), raw)) is not None
+                    }
+                    if key not in canonical:
+                        current.append(key)
+                        watchlist.collected_episodes = current
+                        collected_added += 1
+            await reconcile_db.flush()
+        return {
+            "inventory_added": inventory_added,
+            "inventory_updated": inventory_updated,
+            "collected_added": collected_added,
+        }
+
+    async def _recover_stale_pending_after_final_preflight(
+        self,
+        db: AsyncSession,
+        *,
+        current_task: TransferQueueTask,
+        resource: Resource,
+        payload: dict,
+        missing_episode_keys: list[str],
+    ) -> dict[str, int | bool]:
+        """Recover only identity-matched review rows after a fresh AUTO_SAFE gate."""
+        if not resource.tmdb_id or not resource.season:
+            return {"queued_reactivated": 0, "stale_pending_recovered": 0, "reconciled": 0}
+        batch_evidence = payload.get('batch_presence_preflight') or {}
+        if not batch_evidence.get('cloud_scan_verified'):
+            return {"queued_reactivated": 0, "stale_pending_recovered": 0, "reconciled": 0}
+        decisions = batch_evidence.get('presence_decisions') or {}
+        cloud_present = {
+            str(key)
+            for key, value in decisions.items()
+            if isinstance(value, dict) and value.get('classification') == 'PRESENT_CONFIRMED'
+        }
+        missing = {
+            key
+            for value in missing_episode_keys
+            if (key := canonical_episode_key(int(resource.season), value)) is not None
+        }
+        resource_ids = list((await db.scalars(
+            select(Resource.id).where(
+                Resource.tmdb_id == int(resource.tmdb_id),
+                Resource.season == int(resource.season),
+            )
+        )).all())
+        if not resource_ids:
+            return {"queued_reactivated": 0, "stale_pending_recovered": 0, "reconciled": 0}
+        pending_tasks = list((await db.scalars(
+            select(TransferQueueTask)
+            .where(
+                TransferQueueTask.status == REVIEW_STATUS,
+                TransferQueueTask.id != current_task.id,
+                TransferQueueTask.resource_id.in_(resource_ids),
+            )
+            .order_by(TransferQueueTask.id.asc())
+        )).all())
+        reconciled = 0
+        for review_task in pending_tasks:
+            review_payload = dict(review_task.payload or {})
+            review_resource = await db.get(Resource, review_task.resource_id) if review_task.resource_id else None
+            old_keys = {
+                key
+                for value in (
+                    review_payload.get('episode_keys')
+                    or ([review_resource.episode_key] if review_resource and review_resource.episode_key else [])
+                )
+                if (key := canonical_episode_key(int(resource.season), value)) is not None
+            }
+            if old_keys and old_keys.issubset(cloud_present):
+                review_task.error_message = '[FINAL_PREFLIGHT:REJECTED] RECONCILED_ALREADY_IN_CLOUD'
+                review_task.payload = {
+                    **review_payload,
+                    'preflight_classification': 'REJECTED',
+                    'preflight_reason': 'RECONCILED_ALREADY_IN_CLOUD',
+                    'preflight_stage': 'FINAL_DECISION',
+                    'stale_pending_recovered': True,
+                }
+                review_task.locked_at = None
+                review_task.locked_by = None
+                reconciled += 1
+                continue
+            if not old_keys or not old_keys.issubset(missing) or review_resource is None:
+                continue
+            old_share = str(review_payload.get('share_url') or review_resource.share_url or '')
+            new_share = str(payload.get('share_url') or resource.share_url or '')
+            if not old_share or not new_share or stable_share_key(old_share) == stable_share_key(new_share):
+                continue
+
+            recovered_keys = sorted(missing)
+            review_task.resource_id = resource.id
+            review_task.status = TransferStatus.QUEUED
+            review_task.next_run_at = datetime.now(UTC)
+            review_task.locked_at = None
+            review_task.locked_by = None
+            review_task.error_message = None
+            review_task.idempotency_key = f'{resource.id}:reactivated:{review_task.id}'
+            review_task.payload = {
+                **dict(current_task.payload or {}),
+                'resource_id': resource.id,
+                'share_url': new_share,
+                'tmdb_id': int(resource.tmdb_id),
+                'title': resource.title or payload.get('title'),
+                'season': int(resource.season),
+                'episode_keys': recovered_keys,
+                'selected_episode_keys': recovered_keys,
+                'selection_mode': 'MISSING_EPISODES',
+                'preflight_classification': AUTO_SAFE,
+                'preflight_reason': 'STALE_PENDING_RECOVERED_FROM_NEW_CANDIDATE',
+                'preflight_stage': 'FINAL_DECISION',
+                'queued_reactivated': True,
+                'stale_pending_recovered': True,
+                'candidate_switched': True,
+                'batch_presence_preflight': batch_evidence,
+            }
+            current_task.status = 'CANCELLED'
+            current_task.error_message = f'[STALE_PENDING_RECOVERED] superseded by task {review_task.id}'
+            current_task.locked_at = None
+            current_task.locked_by = None
+            current_task.payload = {
+                **dict(current_task.payload or {}),
+                'preflight_classification': 'REJECTED',
+                'preflight_reason': 'STALE_PENDING_RECOVERED',
+                'stale_pending_recovered_task_id': review_task.id,
+            }
+            from app.models.resource_candidate import ResourceCandidate
+            from app.transfer.candidate_service import mark_candidate_used
+
+            candidates = list((await db.scalars(
+                select(ResourceCandidate).where(
+                    ResourceCandidate.tmdb_id == int(resource.tmdb_id),
+                    ResourceCandidate.season == int(resource.season),
+                    ResourceCandidate.episode_key.in_(recovered_keys),
+                    ResourceCandidate.share_hash == stable_share_key(new_share),
+                )
+            )).all())
+            for candidate in candidates:
+                candidate.resource_id = resource.id
+                await mark_candidate_used(db, candidate=candidate, queue_task_id=review_task.id)
+            await db.flush()
+            return {
+                'queued_reactivated': 1,
+                'stale_pending_recovered': 1,
+                'reconciled': reconciled,
+                'reactivated_task_id': review_task.id,
+            }
+        return {
+            "queued_reactivated": 0,
+            "stale_pending_recovered": int(reconciled > 0),
+            "reconciled": reconciled,
+        }
+
+    async def _batch_episode_presence_preflight(
+        self,
+        db: AsyncSession,
+        *,
+        task: TransferQueueTask,
+        resource: Resource,
+        payload: dict,
+    ) -> dict:
+        """Reconcile share, collected, DB inventory and live cloud before selecting missing episodes."""
+        from app.transfer.adapters.guangya import GuangyaAdapter
+
+        tmdb_id = int(resource.tmdb_id or 0) if resource is not None else 0
+        season = int(resource.season or 0) if resource is not None else 0
+        if tmdb_id <= 0 or season <= 0 or not resource or not resource.share_url:
+            return {'classification': 'REJECTED', 'reason': 'BATCH_IDENTITY_OR_SHARE_MISSING'}
+        payload['preflight_stage'] = 'COLLECTED_READ'
+        watchlists = list((await db.scalars(select(SeriesWatchlist).where(
+            SeriesWatchlist.tmdb_id == tmdb_id,
+            SeriesWatchlist.season == season,
+            SeriesWatchlist.status != 'CANCELLED',
+        ).order_by(SeriesWatchlist.id.asc()))).all())
+        if len(watchlists) != 1:
+            return {'classification': 'NEEDS_REVIEW', 'reason': f'WATCHLIST_MATCH_COUNT={len(watchlists)}'}
+        watchlist = watchlists[0]
+        cloud_cfg = await db.scalar(select(CloudConfig).where(
+            CloudConfig.name == str(payload.get('provider') or resource.cloud_name or 'guangya').casefold()
+        ))
+        if cloud_cfg is None or not cloud_cfg.enabled or not cloud_cfg.auth_ref:
+            return {'classification': 'NEEDS_REVIEW', 'reason': 'CLOUD_PROVIDER_AUTH_UNAVAILABLE'}
+        if not payload.get('media_root') or not payload.get('media_category') or not payload.get('target_folder_id'):
+            return {'classification': 'NEEDS_REVIEW', 'reason': 'CANONICAL_DESTINATION_INCOMPLETE'}
+
+        adapter = GuangyaAdapter(write_enabled=False)
+        payload['preflight_stage'] = 'DESTINATION_LOOKUP'
+        root_report = await adapter.inspect_tmdb_series_root_readonly(
+            auth_token=str(cloud_cfg.auth_ref),
+            target_root_id=str(payload['target_folder_id']),
+            media_root_name=str(payload['media_root']),
+            media_category_name=str(payload['media_category']),
+            tmdb_id=tmdb_id,
+            expected_series_name=str(payload.get('series_folder_name') or ''),
+        )
+        if root_report.get('status') != 'VERIFIED':
+            return {
+                'classification': 'NEEDS_REVIEW',
+                'reason': str(root_report.get('error') or root_report.get('status') or 'SERIES_ROOT_UNVERIFIED'),
+            }
+        roots = list(root_report.get('series_roots') or [])
+        if len(roots) > 1:
+            return {'classification': 'NEEDS_REVIEW', 'reason': 'DUPLICATE_TMDB_ROOT'}
+        root_id = str(roots[0].get('folder_id') or '') if roots else ''
+        if watchlist.remote_series_folder_id and root_id and str(watchlist.remote_series_folder_id) != root_id:
+            return {'classification': 'NEEDS_REVIEW', 'reason': 'WATCHLIST_SERIES_ROOT_MISMATCH'}
+        if watchlist.remote_series_folder_id and not root_id:
+            return {'classification': 'NEEDS_REVIEW', 'reason': 'WATCHLIST_SERIES_ROOT_MISSING'}
+
+        cloud_keys: set[str] = set()
+        cloud_files: list[dict] = []
+        cloud_scan = None
+        cloud_scan_verified = not root_id
+        cloud_pagination_complete = not root_id
+        if root_id:
+            relevant_seasons = list(payload.get('relevant_seasons') or [season])
+            cloud_scan = None
+            for attempt in range(2):
+                payload['preflight_stage'] = 'CLOUD_PRESENCE_SCAN'
+                cloud_scan = await adapter.scan_series_root_readonly(
+                    auth_token=str(cloud_cfg.auth_ref),
+                    tmdb_id=tmdb_id,
+                    series_root_id=root_id,
+                    relevant_seasons=relevant_seasons,
+                    timeout_seconds=12,
+                    max_depth=6,
+                    max_items=5000,
+                    page_size=100,
+                    rate_limit_seconds=0.05,
+                )
+                if cloud_scan.get('scan_status') == 'VERIFIED' and not cloud_scan.get('truncated'):
+                    cloud_scan_verified = True
+                    cloud_pagination_complete = True
+                    break
+                if attempt == 0 and cloud_scan.get('scan_status') in {'API_ERROR', 'TIMEOUT_UNVERIFIED', 'LIMIT_UNVERIFIED'}:
+                    await asyncio.sleep(0.25)
+            if not cloud_scan_verified:
+                return {
+                    'classification': 'NEEDS_REVIEW',
+                    'reason': f"PHYSICAL_CLOUD_SCAN_{(cloud_scan or {}).get('scan_status') or 'UNVERIFIED'}",
+                    'preflight_stage': 'CLOUD_PRESENCE_SCAN',
+                }
+            cloud_keys = {
+                str(value)
+                for value in (cloud_scan.get('cloud_episode_keys_by_season') or {}).get(str(season), [])
+            }
+            cloud_files = [
+                dict(item)
+                for item in cloud_scan.get('verified_files') or []
+                if isinstance(item, dict)
+            ]
+            files_by_key: dict[str, list[dict]] = {}
+            for item in cloud_files:
+                key = str(item.get('episode_key') or '').strip().upper()
+                if key:
+                    files_by_key.setdefault(key, []).append(item)
+            for key, records in files_by_key.items():
+                identities = {
+                    (str(record.get('file_id') or ''), str(record.get('name') or ''), str(record.get('path') or ''))
+                    for record in records
+                }
+                if len(identities) > 1:
+                    return {
+                        'classification': 'NEEDS_REVIEW',
+                        'reason': f'CLOUD_MULTIVERSION_CONFLICT:{key}',
+                        'preflight_stage': 'CLOUD_PRESENCE_SCAN',
+                    }
+            cloud_files = [records[0] for records in files_by_key.values()]
+
+        payload['preflight_stage'] = 'SHARE_PROBE'
+        share_listing = None
+        for attempt in range(3):
+            try:
+                share_listing = await adapter.inspect_share(
+                    share_url=str(resource.share_url),
+                    max_depth=6,
+                    max_items=5000,
+                    max_pages=100,
+                )
+                break
+            except (httpx.TimeoutException, httpx.NetworkError):
+                if attempt == 2:
+                    return {'classification': 'NEEDS_REVIEW', 'reason': 'SHARE_READ_NETWORK_TIMEOUT'}
+                await asyncio.sleep(0.5)
+        if not share_listing or not share_listing.get('share_readable') or share_listing.get('truncated'):
+            return {'classification': 'NEEDS_REVIEW', 'reason': 'SHARE_UNREADABLE_OR_TRUNCATED'}
+        payload['preflight_stage'] = 'INVENTORY_READ'
+        inventory_rows = list((await db.scalars(select(CloudDiskInventory).where(
+            CloudDiskInventory.tmdb_id == tmdb_id,
+            CloudDiskInventory.season == season,
+        ))).all())
+        inventory_keys = {f'S{season:02d}E{int(row.episode):02d}' for row in inventory_rows}
+
+        payload['preflight_stage'] = 'ACTIVE_TASK_SCAN'
+        related_resources = list((await db.scalars(select(Resource).where(
+            Resource.tmdb_id == tmdb_id,
+            Resource.season == season,
+        ))).all())
+        related_by_id = {row.id: row for row in related_resources}
+        related_tasks = list((await db.scalars(select(TransferQueueTask).where(
+            TransferQueueTask.resource_id.in_(list(related_by_id))
+        ))).all()) if related_by_id else []
+        completed_keys: set[str] = set()
+        active_keys: set[str] = set()
+        payload['preflight_stage'] = 'SHARE_EPISODE_MAP'
+        from app.transfer.episode_matcher import extract_video_episode_keys
+        share_keys = {
+            key
+            for item in (share_listing.get('video_files') or [])
+            for key in extract_video_episode_keys(str(item.get('name') or ''), known_season=season)
+            if int(key[1:3]) == season
+        }
+        for episode_key in share_keys:
+            targets = {episode_key}
+            for other in related_tasks:
+                if other.id == task.id:
+                    continue
+                if not task_matches_episode(
+                    other.payload,
+                    tmdb_id=tmdb_id,
+                    season=season,
+                    episode_keys=targets,
+                    resource=related_by_id.get(other.resource_id),
+                ):
+                    continue
+                status = str(other.status).upper()
+                if status in {'SUCCESS', 'COMPLETED'}:
+                    completed_keys.add(episode_key)
+                elif _is_active_episode_task_status(status):
+                    active_keys.add(episode_key)
+
+        payload['preflight_stage'] = 'FINAL_DECISION'
+        plan = plan_missing_episode_transfer(
+            list(share_listing.get('video_files') or []),
+            season=season,
+            trigger_episode_keys=list(payload.get('episode_keys') or ([resource.episode_key] if resource.episode_key else [])),
+            collected_episode_keys=list(watchlist.collected_episodes or []),
+            inventory_episode_keys=inventory_keys,
+            cloud_episode_keys=cloud_keys,
+            completed_episode_keys=completed_keys,
+            active_episode_keys=active_keys,
+            cloud_scan_verified=cloud_scan_verified,
+            cloud_scan_truncated=bool(cloud_scan and cloud_scan.get('truncated')),
+            cloud_pagination_complete=cloud_pagination_complete,
+        )
+        return {
+            **plan.as_dict(),
+            '_share_evidence': share_listing,
+            '_cloud_evidence': cloud_files,
+            '_cloud_scan_verified': cloud_scan_verified,
+            '_cloud_verified_episode_keys': sorted(cloud_keys),
+            '_watchlist_id': watchlist.id,
+            '_cloud_series_root_id': root_id,
+            '_inventory_prefix': payload.get('inventory_prefix'),
+            '_resource_title': resource.title,
+        }
 
     async def _runtime_final_preflight(
         self,
@@ -381,6 +881,180 @@ class TransferQueueWorker:
             if str(task.status) != str(TransferStatus.RUNNING) or str(task.locked_by or '') != self.worker_id:
                 logger.warning('Transfer task %s is no longer owned by this worker before final runtime preflight', task_id)
                 return None
+            raw_episode_keys = payload.get('episode_keys') or ([resource.episode_key] if resource and resource.episode_key else [])
+            canonical_batch_keys = {
+                key
+                for value in raw_episode_keys
+                if (key := canonical_episode_key(int(resource.season or 1), value)) is not None
+            } if resource is not None else set()
+            if len(canonical_batch_keys) > 1:
+                payload['selection_mode'] = 'MISSING_EPISODES'
+            resume_stage = str(payload.get('execution_stage') or '').strip().upper()
+            if resume_stage in {'RESTORED', 'RESTORE_VERIFIED', 'RENAMING', 'RENAME_VERIFIED'}:
+                resume_ids = (
+                    payload.get('selected_verified_file_ids')
+                    or (payload.get('selection_snapshot') or {}).get('selected_file_ids')
+                )
+                resume_names = (
+                    payload.get('selected_file_names')
+                    or payload.get('selected_verified_names')
+                    or payload.get('expected_files')
+                )
+                if not payload.get('remote_folder_id') or not resume_ids or not resume_names:
+                    task.status = 'PENDING'
+                    task.error_message = '[FINAL_PREFLIGHT:NEEDS_REVIEW] RESUME_FENCE_INCOMPLETE'
+                    task.payload = {
+                        **dict(task.payload or {}),
+                        'preflight_classification': 'NEEDS_REVIEW',
+                        'preflight_reason': 'RESUME_FENCE_INCOMPLETE',
+                    }
+                    task.locked_at = None
+                    task.locked_by = None
+                    await db.flush()
+                    return None
+                logger.info('Transfer task %s resumes from verified remote stage=%s without another restore', task_id, resume_stage)
+                return payload
+            batch_share_evidence = None
+            cloud_verified = False
+            cloud_verified_episode_keys: list[str] = []
+            if str(payload.get('selection_mode') or '').upper() == 'MISSING_EPISODES':
+                try:
+                    async with asyncio.timeout(BATCH_PREFLIGHT_TIMEOUT_SECONDS):
+                        batch_plan = await self._batch_episode_presence_preflight(
+                            db,
+                            task=task,
+                            resource=resource,
+                            payload=payload,
+                        )
+                        batch_share_evidence = batch_plan.pop('_share_evidence', None)
+                        cloud_evidence = batch_plan.pop('_cloud_evidence', [])
+                        cloud_verified = bool(batch_plan.pop('_cloud_scan_verified', False))
+                        cloud_verified_episode_keys = batch_plan.pop('_cloud_verified_episode_keys', [])
+                        watchlist_id = batch_plan.pop('_watchlist_id', None)
+                        root_id = batch_plan.pop('_cloud_series_root_id', '')
+                        inventory_prefix = batch_plan.pop('_inventory_prefix', None)
+                        resource_title = batch_plan.pop('_resource_title', '')
+                        metadata_reconcile = batch_plan.get('metadata_reconcile') or {}
+                        if metadata_reconcile:
+                            if resource is None:
+                                raise RuntimeError('metadata reconciliation resource is missing')
+                            if not cloud_verified or watchlist_id is None:
+                                raise RuntimeError('metadata reconciliation lacks verified cloud evidence')
+                            reconcile_stage = 'INVENTORY_READ' if any(
+                                'inventory' in ledgers for ledgers in metadata_reconcile.values()
+                            ) else 'COLLECTED_READ'
+                            payload['preflight_stage'] = reconcile_stage
+                            batch_plan['metadata_reconcile_result'] = await self._reconcile_verified_cloud_presence(
+                                tmdb_id=int(resource.tmdb_id),
+                                season=int(resource.season),
+                                title=str(resource_title or resource.title or ''),
+                                watchlist_id=int(watchlist_id),
+                                series_root_id=str(root_id or ''),
+                                inventory_prefix=inventory_prefix,
+                                metadata_reconcile=metadata_reconcile,
+                                cloud_files=cloud_evidence,
+                                provider=str(payload.get('provider') or resource.cloud_name or 'guangya'),
+                            )
+                except TimeoutError as exc:
+                    stage = str(payload.get('preflight_stage') or 'UNKNOWN')
+                    detail = f'TimeoutError: BATCH_PREFLIGHT_TIMEOUT after {BATCH_PREFLIGHT_TIMEOUT_SECONDS:.0f}s at stage={stage}'
+                    safe_exc = RuntimeError(detail)
+                    logger.exception(
+                        'Batch preflight failed task_id=%s resource_id=%s tmdb_id=%s season=%s stage=%s episode_count=%s detail=%s',
+                        task_id, resource_id, getattr(resource, 'tmdb_id', None), getattr(resource, 'season', None),
+                        stage, len(payload.get('episode_keys') or []), detail,
+                        exc_info=(type(safe_exc), safe_exc, exc.__traceback__),
+                    )
+                    batch_plan = {
+                        'classification': 'NEEDS_REVIEW',
+                        'reason': 'BATCH_PREFLIGHT_TIMEOUT',
+                        'detail': detail,
+                        'preflight_stage': stage,
+                    }
+                    batch_share_evidence = None
+                except Exception as exc:
+                    stage = str(payload.get('preflight_stage') or 'UNKNOWN')
+                    detail = _safe_preflight_detail(exc)
+                    safe_exc = RuntimeError(detail)
+                    logger.exception(
+                        'Batch preflight failed task_id=%s resource_id=%s tmdb_id=%s season=%s stage=%s episode_count=%s exception_type=%s detail=%s',
+                        task_id, resource_id, getattr(resource, 'tmdb_id', None), getattr(resource, 'season', None),
+                        stage, len(payload.get('episode_keys') or []), type(exc).__name__, detail,
+                        exc_info=(type(safe_exc), safe_exc, exc.__traceback__),
+                    )
+                    batch_plan = {
+                        'classification': 'NEEDS_REVIEW',
+                        'reason': 'BATCH_PREFLIGHT_EXCEPTION',
+                        'detail': detail,
+                        'preflight_stage': stage,
+                    }
+                    batch_share_evidence = None
+                batch_classification = str(batch_plan.get('classification') or 'NEEDS_REVIEW')
+                batch_reason = str(batch_plan.get('reason') or 'BATCH_PREFLIGHT_INCOMPLETE')
+                if batch_reason == 'NO_MISSING_EPISODES' and cloud_verified and resource is not None:
+                    batch_plan['stale_pending_recovery'] = await self._recover_stale_pending_after_final_preflight(
+                        db,
+                        current_task=task,
+                        resource=resource,
+                        payload={
+                            **payload,
+                            'batch_presence_preflight': {
+                                'cloud_scan_verified': True,
+                                'presence_decisions': batch_plan.get('presence_decisions') or {},
+                            },
+                        },
+                        missing_episode_keys=[],
+                    )
+                batch_stage = str(batch_plan.get('preflight_stage') or payload.get('preflight_stage') or 'UNKNOWN')
+                if batch_classification != AUTO_SAFE:
+                    task.status = REVIEW_STATUS
+                    if batch_reason == 'NO_MISSING_EPISODES':
+                        batch_reason = 'RECONCILED_ALREADY_IN_CLOUD'
+                    task.error_message = f'[FINAL_PREFLIGHT:{batch_classification}] stage={batch_stage} {batch_reason}'[:4000]
+                    task.payload = {
+                        **dict(task.payload or {}),
+                        'preflight_classification': batch_classification,
+                        'preflight_reason': batch_reason,
+                        'preflight_stage': batch_stage,
+                        'batch_presence_preflight': batch_plan,
+                    }
+                    task.locked_at = None
+                    task.locked_by = None
+                    await db.flush()
+                    logger.warning('Transfer task %s blocked by batch presence preflight: stage=%s %s %s', task_id, batch_stage, batch_classification, batch_reason)
+                    return None
+                missing_keys = [str(value) for value in batch_plan.get('missing_episode_keys') or []]
+                if not missing_keys:
+                    task.status = REVIEW_STATUS
+                    task.error_message = '[FINAL_PREFLIGHT:REJECTED] RECONCILED_ALREADY_IN_CLOUD'
+                    task.payload = {
+                        **dict(task.payload or {}),
+                        'preflight_classification': 'REJECTED',
+                        'preflight_reason': 'RECONCILED_ALREADY_IN_CLOUD',
+                        'preflight_stage': batch_stage,
+                        'batch_presence_preflight': batch_plan,
+                    }
+                    task.locked_at = None
+                    task.locked_by = None
+                    await db.flush()
+                    return None
+                payload['episode_keys'] = missing_keys
+                payload['selected_episode_keys'] = missing_keys
+                payload['selection_mode'] = 'MISSING_EPISODES'
+                payload['batch_presence_preflight'] = {
+                    'classification': batch_classification,
+                    'reason': batch_reason,
+                    'preflight_stage': batch_stage,
+                    'share_episode_keys': list(batch_plan.get('share_episode_keys') or []),
+                    'missing_episode_keys': missing_keys,
+                    'presence_decisions': batch_plan.get('presence_decisions') or {},
+                    'metadata_reconcile': batch_plan.get('metadata_reconcile') or {},
+                    'metadata_reconcile_result': batch_plan.get('metadata_reconcile_result') or {},
+                    'cloud_scan_verified': cloud_verified,
+                    'cloud_verified_episode_keys': list(cloud_verified_episode_keys),
+                }
+                for stale_key in ('selection_snapshot', 'selected_file_ids', 'selected_file_names', 'selected_episode_by_file_id'):
+                    payload.pop(stale_key, None)
             route = {
                 'media_root': payload.get('media_root'),
                 'media_category': payload.get('media_category'),
@@ -389,13 +1063,18 @@ class TransferQueueWorker:
             try:
                 async def remote_validator(**kwargs):
                     target = str(payload.get('target_folder_id') or kwargs.get('target_folder_id') or '')
-                    return await validate_remote_canary(**{**kwargs, 'target_folder_id': target})
+                    validator_kwargs = {**kwargs, 'target_folder_id': target}
+                    if batch_share_evidence is not None:
+                        validator_kwargs['share_override'] = batch_share_evidence
+                    return await validate_remote_canary(**validator_kwargs)
 
                 report = await preflight_task(
                     db,
                     task_id,
                     remote_validator=remote_validator,
                     allow_running_locked_by=self.worker_id,
+                    episode_keys_override=list(payload.get('episode_keys') or []),
+                    selection_mode_override=str(payload.get('selection_mode') or '') or None,
                 )
                 if resource is None:
                     decision = {
@@ -442,6 +1121,31 @@ class TransferQueueWorker:
             selected_ids = [str(value).strip() for value in (remote.get('selected_file_ids') or []) if str(value).strip()]
             selected_names = [str(value).strip() for value in (remote.get('selected_file_names') or []) if str(value).strip()]
             selection_mode = str(remote.get('selection_mode') or '').strip()
+            selected_episode_keys = [str(value).strip() for value in (remote.get('selected_episode_keys') or []) if str(value).strip()]
+            episode_file_map = {
+                str(key).strip(): str(value).strip()
+                for key, value in (remote.get('episode_file_map') or {}).items()
+                if str(key).strip() and str(value).strip()
+            }
+            if (
+                selection_mode == 'MISSING_EPISODES'
+                and (
+                    set(episode_file_map) != set(payload.get('episode_keys') or [])
+                    or set(episode_file_map.values()) != set(selected_ids)
+                    or set(selected_episode_keys) != set(payload.get('episode_keys') or [])
+                )
+            ):
+                task.status = 'PENDING'
+                task.error_message = '[FINAL_PREFLIGHT:NEEDS_REVIEW] RUNTIME_EPISODE_SELECTION_MAP_INCOMPLETE'
+                task.payload = {
+                    **dict(task.payload or {}),
+                    'preflight_classification': 'NEEDS_REVIEW',
+                    'preflight_reason': 'RUNTIME_EPISODE_SELECTION_MAP_INCOMPLETE',
+                }
+                task.locked_at = None
+                task.locked_by = None
+                await db.flush()
+                return None
             if not selected_ids or not selected_names or not selection_mode:
                 task.status = 'PENDING'
                 task.error_message = '[FINAL_PREFLIGHT:NEEDS_REVIEW] RUNTIME_SELECTION_SNAPSHOT_INCOMPLETE'
@@ -456,11 +1160,40 @@ class TransferQueueWorker:
                 await db.flush()
                 logger.warning('Transfer task %s blocked: runtime selection snapshot incomplete', task.id)
                 return None
+            recovery = await self._recover_stale_pending_after_final_preflight(
+                db,
+                current_task=task,
+                resource=resource,
+                payload=payload,
+                missing_episode_keys=list(payload.get('episode_keys') or []),
+            ) if resource is not None and selection_mode == 'MISSING_EPISODES' else {
+                'queued_reactivated': 0,
+                'stale_pending_recovered': 0,
+                'reconciled': 0,
+            }
+            payload['queued_reactivated'] = bool(recovery.get('queued_reactivated'))
+            payload['stale_pending_recovered'] = bool(recovery.get('stale_pending_recovered'))
+            payload['candidate_switched'] = bool(recovery.get('queued_reactivated'))
+            if recovery.get('queued_reactivated'):
+                logger.info(
+                    'stale PENDING task reactivated after verified AUTO_SAFE preflight: old_task=%s replacement_task=%s',
+                    recovery.get('reactivated_task_id'),
+                    task.id,
+                )
+                return None
             snapshot = {
                 'selection_mode': selection_mode,
                 'selected_file_ids': selected_ids,
                 'selected_file_names': selected_names,
+                'selected_episode_keys': selected_episode_keys,
+                'episode_file_map': episode_file_map,
             }
+            if episode_file_map:
+                payload['selected_episode_keys'] = selected_episode_keys
+                payload['selected_episode_by_file_id'] = {
+                    file_id: episode_key for episode_key, file_id in episode_file_map.items()
+                }
+                payload['episode_keys'] = selected_episode_keys
             payload.update({
                 'preflight_classification': AUTO_SAFE,
                 'preflight_reason': reason,
@@ -470,6 +1203,11 @@ class TransferQueueWorker:
             })
             task.payload = {
                 **dict(task.payload or {}),
+                'selection_mode': selection_mode,
+                'episode_keys': list(payload.get('episode_keys') or []),
+                'selected_episode_keys': list(payload.get('selected_episode_keys') or []),
+                'selected_episode_by_file_id': dict(payload.get('selected_episode_by_file_id') or {}),
+                'batch_presence_preflight': payload.get('batch_presence_preflight'),
                 'preflight_classification': AUTO_SAFE,
                 'preflight_reason': reason,
                 'preflight_runtime_verified_at': payload['preflight_runtime_verified_at'],
@@ -496,6 +1234,15 @@ class TransferQueueWorker:
             payload = {}
             try:
                 payload = await self._hydrate_payload(db, task)
+                resource = await db.get(Resource, task.resource_id) if task.resource_id is not None else None
+                if not payload.get('selection_mode') and resource is not None and resource.season:
+                    canonical_keys = {
+                        key
+                        for value in (payload.get('episode_keys') or ([resource.episode_key] if resource.episode_key else []))
+                        if (key := canonical_episode_key(int(resource.season), value)) is not None
+                    }
+                    if len(canonical_keys) > 1:
+                        payload['selection_mode'] = 'MISSING_EPISODES'
                 gate = await self._final_local_preflight(db, task, payload)
             except DestinationMetadataIncomplete as exc:
                 gate = ('NEEDS_REVIEW', str(exc))
@@ -609,6 +1356,88 @@ class TransferQueueWorker:
         except Exception as exc:  # noqa: BLE001 - observability failure is not transfer failure
             logger.warning('Could not persist notification result for task %s: %s', task_id, exc)
 
+    async def _prepare_success_notification_payload(
+        self,
+        *,
+        task_payload: dict,
+        resource_id: int | None,
+        transfer_result: dict,
+    ) -> dict:
+        """Re-read completed ledgers before composing cumulative progress."""
+        notification_payload = dict(task_payload)
+        if resource_id is None:
+            notification_payload['collection_progress_verified'] = False
+            return notification_payload
+        async with self.session_factory() as db:
+            resource = await db.get(Resource, resource_id)
+            if resource is None or not resource.tmdb_id or not resource.season:
+                notification_payload['collection_progress_verified'] = False
+                return notification_payload
+            season = int(resource.season)
+            watchlists = list((await db.scalars(
+                select(SeriesWatchlist).where(
+                    SeriesWatchlist.tmdb_id == int(resource.tmdb_id),
+                    SeriesWatchlist.season == season,
+                    SeriesWatchlist.status != 'CANCELLED',
+                ).order_by(SeriesWatchlist.id.asc())
+            )).all())
+            if len(watchlists) != 1:
+                notification_payload['collection_progress_verified'] = False
+                return notification_payload
+            watchlist = watchlists[0]
+            inventory_rows = list((await db.scalars(
+                select(CloudDiskInventory).where(
+                    CloudDiskInventory.tmdb_id == int(resource.tmdb_id),
+                    CloudDiskInventory.season == season,
+                )
+            )).all())
+        collected_keys = {
+            key
+            for value in (watchlist.collected_episodes or [])
+            if (key := canonical_episode_key(season, value)) is not None
+        }
+        inventory_keys = {
+            f'S{season:02d}E{int(row.episode):02d}'
+            for row in inventory_rows
+            if row.episode is not None
+        }
+        batch_evidence = notification_payload.get('batch_presence_preflight') or {}
+        cloud_scan_verified = bool(batch_evidence.get('cloud_scan_verified'))
+        cloud_keys = {
+            key
+            for value in batch_evidence.get('cloud_verified_episode_keys') or []
+            if (key := canonical_episode_key(season, value)) is not None
+        }
+        if transfer_result.get('verified') and transfer_result.get('inventory', {}).get('status') == 'SYNCED':
+            cloud_keys.update(
+                key
+                for value in transfer_result.get('selected_episode_keys') or []
+                if (key := canonical_episode_key(season, value)) is not None
+            )
+        progress_verified = (
+            cloud_scan_verified
+            and collected_keys == inventory_keys
+            and collected_keys == cloud_keys
+        )
+        notification_payload.update({
+            'season': season,
+            'total_episodes': int(watchlist.total_episodes or notification_payload.get('total_episodes') or 0),
+            'collected_episodes': sorted(collected_keys),
+            'collected_episode_keys': sorted(collected_keys),
+            'inventory_episode_keys': sorted(inventory_keys),
+            'cloud_verified_episode_keys': sorted(cloud_keys),
+            'inventory_count': len(inventory_keys),
+            'cloud_count': len(cloud_keys),
+            'collection_progress_verified': progress_verified,
+        })
+        total = int(notification_payload['total_episodes'] or 0)
+        if total > 0:
+            expected = {f'S{season:02d}E{number:02d}' for number in range(1, total + 1)}
+            notification_payload['missing_episode_keys'] = sorted(expected - collected_keys)
+        else:
+            notification_payload['missing_episode_keys'] = []
+        return notification_payload
+
     # ------------------------------------------------------------------ #
     # Transaction B: verified success
     # ------------------------------------------------------------------ #
@@ -645,6 +1474,76 @@ class TransferQueueWorker:
                 'rename_status': outcome.rename_status or payload.get('rename_status'),
                 'destination_kind': payload.get('destination_kind'),
             }
+            verified_episode_files = list(outcome.verified_episode_files or payload.get('verified_episode_files') or [])
+            verified_episode_by_name: dict[str, dict] = {}
+            episode_integrity_error = None
+            if not is_promotion and resource is not None and resource.season is not None:
+                raw_expected_keys = (
+                    payload.get('selected_episode_keys')
+                    or payload.get('episode_keys')
+                    or ([resource.episode_key] if resource.episode_key else [])
+                )
+                expected_episode_keys = {
+                    key for value in raw_expected_keys
+                    if (key := canonical_episode_key(resource.season, value)) is not None
+                }
+                for item in verified_episode_files:
+                    name = str(item.get('file_name') or item.get('name') or '').strip()
+                    key = canonical_episode_key(resource.season, item.get('episode_key'))
+                    if not name or not key or name in verified_episode_by_name or key in {
+                        str(row.get('episode_key')) for row in verified_episode_by_name.values()
+                    }:
+                        episode_integrity_error = 'VERIFIED_EPISODE_MAP_INVALID'
+                        break
+                    verified_episode_by_name[name] = {**dict(item), 'file_name': name, 'episode_key': key}
+                if not verified_episode_by_name and len(verified_files) == 1 and len(expected_episode_keys) == 1:
+                    name = verified_files[0]
+                    remote_record = next(
+                        (row for row in outcome.remote_file_records or () if str(row.get('name') or row.get('file_name') or '').strip() == name),
+                        {},
+                    )
+                    key = next(iter(expected_episode_keys))
+                    verified_episode_by_name[name] = {
+                        'episode_key': key,
+                        'file_name': name,
+                        'file_id': str(remote_record.get('file_id') or remote_record.get('fileId') or ''),
+                        'size': remote_record.get('size') or remote_record.get('fileSize') or 0,
+                    }
+                observed_episode_keys = {str(row['episode_key']) for row in verified_episode_by_name.values()}
+                if episode_integrity_error is None and (
+                    set(verified_episode_by_name) != set(verified_files)
+                    or not expected_episode_keys
+                    or observed_episode_keys != expected_episode_keys
+                ):
+                    episode_integrity_error = 'VERIFIED_EPISODE_MAP_INCOMPLETE'
+                if episode_integrity_error:
+                    await BotSettingsService.set_transfer_paused(db, True)
+                    task.status = TransferStatus.RETRY_WAIT
+                    task.next_run_at = datetime.now(UTC)
+                    task.error_message = f'[SYSTEM_PAUSE:{episode_integrity_error}] verified readback closure is incomplete'[:4000]
+                    task.payload = {
+                        **dict(task.payload or {}),
+                        **payload,
+                        'execution_stage': 'RENAME_VERIFIED',
+                        'remote_folder_id': outcome.remote_folder_id,
+                        'selected_file_names': verified_files,
+                        'verified_remote_records': list(outcome.remote_file_records or ()),
+                        'preflight_classification': 'NEEDS_REVIEW',
+                        'preflight_reason': episode_integrity_error,
+                    }
+                    task.result = {
+                        **dict(task.result or {}),
+                        'verified': bool(outcome.verified),
+                        'selected_file_names': verified_files,
+                        'integrity_error': episode_integrity_error,
+                    }
+                    task.locked_at = None
+                    task.locked_by = None
+                    await db.flush()
+                    logger.critical('transfer_paused=1: task=%s %s', task_id, episode_integrity_error)
+                    return False
+                transfer_result['verified_episode_files'] = list(verified_episode_by_name.values())
+                transfer_result['selected_episode_keys'] = sorted(observed_episode_keys)
             inventory_result: dict = {
                 'status': 'NOT_ATTEMPTED',
                 'written': 0,
@@ -662,6 +1561,7 @@ class TransferQueueWorker:
                         tmdb_id=resource.tmdb_id,
                         series_folder_name=str(payload.get('series_folder_name') or resource.title or resource.tmdb_id),
                         destination_prefix=payload.get('destination_prefix'),
+                        relevant_seasons=payload.get('relevant_seasons'),
                     )
                     inventory_result.update({
                         'status': 'PROMOTION_PATHS_UPDATED',
@@ -689,32 +1589,38 @@ class TransferQueueWorker:
                     name for name in verified_files
                     if not selected_names or name in selected_names
                 ]
-                declared_keys = list(payload.get('episode_keys') or ([resource.episode_key] if resource.episode_key else []))
-                explicit_episode_key = declared_keys[0] if len(declared_keys) == 1 else None
                 sync_errors: list[str] = []
                 for file_name in inventory_files:
+                    episode_record = verified_episode_by_name.get(file_name)
+                    if episode_record is None:
+                        sync_errors.append('VERIFIED_EPISODE_MAP_MISSING')
+                        continue
                     try:
-                        sync = await CloudInventoryService.upsert_verified_transfer(
-                            db,
-                            tmdb_id=resource.tmdb_id,
-                            title=resource.title or payload.get('title'),
-                            season=resource.season,
-                            episode_key=explicit_episode_key,
-                            file_name=file_name,
-                            verified=True,
-                            remote_folder_id=outcome.remote_folder_id,
-                            provider=payload.get('provider') or resource.cloud_name,
-                            source=resource.source_type,
-                            rel_path=(
-                                f"{str(payload.get('remote_rel_path_prefix')).strip('/')}/{file_name}"
-                                if payload.get('remote_rel_path_prefix')
-                                else payload.get('remote_rel_path')
-                            ),
-                            verified_at=datetime.now(UTC),
-                        )
+                        async with db.begin_nested():
+                            sync = await CloudInventoryService.upsert_verified_transfer(
+                                db,
+                                tmdb_id=resource.tmdb_id,
+                                title=resource.title or payload.get('title'),
+                                season=resource.season,
+                                episode_key=str(episode_record['episode_key']),
+                                file_name=file_name,
+                                verified=True,
+                                remote_file_id=str(episode_record.get('file_id') or '') or None,
+                                remote_folder_id=outcome.remote_folder_id,
+                                provider=payload.get('provider') or resource.cloud_name,
+                                source=resource.source_type,
+                                rel_path=(
+                                    f"{str(payload.get('remote_rel_path_prefix')).strip('/')}/{file_name}"
+                                    if payload.get('remote_rel_path_prefix')
+                                    else payload.get('remote_rel_path')
+                                ),
+                                verified_at=datetime.now(UTC),
+                            )
                         inventory_result['results'].append(sync.as_dict())
                         if sync.persisted:
                             inventory_result['written'] += 1
+                        else:
+                            sync_errors.append(str(sync.reason or sync.status or 'INVENTORY_NOT_PERSISTED'))
                     except Exception as inventory_exc:
                         sync_errors.append(type(inventory_exc).__name__)
                         logger.exception(
@@ -736,8 +1642,20 @@ class TransferQueueWorker:
                     })
             transfer_result['inventory'] = inventory_result
             if resource is not None and verified_files and not is_promotion:
-                # Persist only the provider readback set selected for this task.
-                resource.file_names = verified_files
+                # Retain earlier files for this same resource only when Inventory
+                # already proves their identity, then append the current readback set.
+                preserved_files: list[str] = []
+                if resource.tmdb_id and resource.season:
+                    known_inventory_names = set((await db.scalars(select(CloudDiskInventory.file_name).where(
+                        CloudDiskInventory.tmdb_id == resource.tmdb_id,
+                        CloudDiskInventory.season == resource.season,
+                    ))).all())
+                    preserved_files = [
+                        str(value).strip()
+                        for value in (resource.file_names or [])
+                        if str(value).strip() in known_inventory_names
+                    ]
+                resource.file_names = list(dict.fromkeys([*preserved_files, *verified_files]))
             if resource is not None and outcome.remote_folder_id:
                 resource.transferred_folder_id = outcome.remote_folder_id
             if resource is not None and resource.tmdb_id and resource.season:
@@ -749,38 +1667,115 @@ class TransferQueueWorker:
                     watchlist.remote_series_folder_id = outcome.remote_series_folder_id
                     watchlist.remote_destination_kind = outcome.remote_destination_kind or payload.get('destination_kind')
             task.payload = {**dict(task.payload or {}), **payload}
-            await TransferQueueService.mark_completed(db, task, transfer_result)
+            if (
+                not is_promotion
+                and resource is not None
+                and resource.season is not None
+                and inventory_result.get('status') != 'SYNCED'
+            ):
+                await BotSettingsService.set_transfer_paused(db, True)
+                task.status = TransferStatus.RETRY_WAIT
+                task.next_run_at = datetime.now(UTC)
+                task.error_message = '[SYSTEM_PAUSE:INVENTORY_SYNC_FAILED] verified files are not fully inventoried'[:4000]
+                task.payload = {
+                    **dict(task.payload or {}),
+                    'execution_stage': 'RENAME_VERIFIED',
+                    'remote_folder_id': outcome.remote_folder_id,
+                    'selected_file_names': verified_files,
+                    'verified_remote_records': list(outcome.remote_file_records or ()),
+                }
+                task.result = {
+                    **dict(task.result or {}),
+                    **transfer_result,
+                    'integrity_error': 'INVENTORY_SYNC_FAILED',
+                }
+                task.locked_at = None
+                task.locked_by = None
+                await db.flush()
+                logger.critical('transfer_paused=1: task=%s Inventory closure failed', task_id)
+                return False
+            verified_episode_keys = list(dict.fromkeys(
+                str(record['episode_key'])
+                for record in verified_episode_by_name.values()
+                if record.get('episode_key')
+            ))
+            if not verified_episode_keys:
+                verified_episode_keys = list(payload.get('episode_keys') or ([resource.episode_key] if resource and resource.episode_key else []))
+            if not is_promotion and resource is not None and resource.tmdb_id and resource.season and verified_episode_keys:
+                try:
+                    async with db.begin_nested():
+                        await WatchlistService.mark_collected(
+                            db,
+                            tmdb_id=resource.tmdb_id,
+                            season=resource.season,
+                            episode_keys=verified_episode_keys,
+                        )
+                except Exception as collected_exc:  # noqa: BLE001 - pause and retain verified remote fence on DB closure failure
+                    await BotSettingsService.set_transfer_paused(db, True)
+                    task.status = TransferStatus.RETRY_WAIT
+                    task.next_run_at = datetime.now(UTC)
+                    task.error_message = '[SYSTEM_PAUSE:COLLECTED_SYNC_FAILED] verified files are not fully collected'[:4000]
+                    task.payload = {
+                        **dict(task.payload or {}),
+                        **payload,
+                        'execution_stage': 'RENAME_VERIFIED',
+                        'remote_folder_id': outcome.remote_folder_id,
+                        'selected_file_names': verified_files,
+                        'verified_remote_records': list(outcome.remote_file_records or ()),
+                    }
+                    task.result = {
+                        **dict(task.result or {}),
+                        **transfer_result,
+                        'integrity_error': 'COLLECTED_SYNC_FAILED',
+                    }
+                    task.locked_at = None
+                    task.locked_by = None
+                    await db.flush()
+                    logger.critical(
+                        'transfer_paused=1: task=%s collected update failed (%s)',
+                        task_id,
+                        type(collected_exc).__name__,
+                    )
+                    return False
             if resource is not None and not is_promotion:
                 resource.status = ResourceStatus.COMPLETED
-            # Phase 2C §四/§六: a verified transfer retires the candidate.
             if resource is not None and not is_promotion and resource.tmdb_id and resource.season:
                 from app.transfer.candidate_service import (
                     get_candidates_for_episode,
                     mark_candidate_transferred,
                 )
 
-                episode_keys = list(payload.get('episode_keys') or ([resource.episode_key] if resource.episode_key else []))
-                for episode_key in episode_keys:
-                    for candidate in await get_candidates_for_episode(
-                        db,
-                        tmdb_id=resource.tmdb_id,
-                        season=resource.season,
-                        episode_key=episode_key,
-                    ):
-                        if candidate.resource_id == resource.id or (
-                            resource.share_url and candidate.share_hash == stable_share_key(resource.share_url)
-                        ):
-                            await mark_candidate_transferred(db, candidate=candidate)
-            if not is_promotion and resource is not None and resource.tmdb_id and resource.season:
-                keys = list(payload.get('episode_keys') or ([resource.episode_key] if resource.episode_key else []))
-                if keys:
-                    await WatchlistService.mark_collected(db, tmdb_id=resource.tmdb_id, season=resource.season, episode_keys=keys)
+                try:
+                    async with db.begin_nested():
+                        for episode_key in verified_episode_keys:
+                            for candidate in await get_candidates_for_episode(
+                                db,
+                                tmdb_id=resource.tmdb_id,
+                                season=resource.season,
+                                episode_key=episode_key,
+                            ):
+                                if candidate.resource_id == resource.id or (
+                                    resource.share_url and candidate.share_hash == stable_share_key(resource.share_url)
+                                ):
+                                    await mark_candidate_transferred(db, candidate=candidate)
+                except Exception as candidate_exc:  # noqa: BLE001 - best-effort ancillary candidate ledger
+                    logger.warning('Candidate ledger update failed for task %s: %s', task_id, type(candidate_exc).__name__)
+            await TransferQueueService.mark_completed(db, task, transfer_result)
+        notification_payload = (
+            payload
+            if is_promotion
+            else await self._prepare_success_notification_payload(
+                task_payload=payload,
+                resource_id=resource_id,
+                transfer_result=transfer_result,
+            )
+        )
         notification_result = (
             NotificationResult('NOTIFICATION_SKIPPED_PROMOTION_PREVIEW', False, error='PROMOTION_CARD_PREVIEW_ONLY')
             if is_promotion
             else await self._notify_success(
                 task_id=task_id,
-                task_payload=payload,
+                task_payload=notification_payload,
                 transfer_result=transfer_result,
                 resource=resource,
             )
@@ -797,12 +1792,38 @@ class TransferQueueWorker:
         message = str(exc) or exc.__class__.__name__
         rename_resume = isinstance(exc, RenameUnverifiedError)
         promotion_resume = isinstance(exc, PromotionUnverifiedError)
+        exception_code = str(getattr(exc, 'code', '') or '')
+        scope_integrity_failure = (
+            category == TransferErrorCategory.TRANSFER_SCOPE_VIOLATION
+            or exception_code == 'DESTINATION_EPISODE_OVERLAP'
+        )
         async with self.session_factory() as db, db.begin():
             task = await db.get(TransferQueueTask, task_id)
             if task is None:
                 logger.warning('transfer task %s disappeared before failure recording', task_id)
                 return True
             resource = await db.get(Resource, resource_id) if resource_id is not None else None
+            if scope_integrity_failure:
+                await BotSettingsService.set_transfer_paused(db, True)
+                task.status = 'PENDING'
+                task.error_message = f'[SYSTEM_PAUSE:{exception_code or category}] {message}'[:4000]
+                task.payload = {
+                    **dict(task.payload or {}),
+                    **payload,
+                    'preflight_classification': 'NEEDS_REVIEW',
+                    'preflight_reason': exception_code or str(category),
+                    'scope_integrity_hold': True,
+                    'scope_integrity_code': exception_code or str(category),
+                }
+                task.result = {
+                    **dict(task.result or {}),
+                    'integrity_error': exception_code or str(category),
+                }
+                task.locked_at = None
+                task.locked_by = None
+                await db.flush()
+                logger.critical('transfer_paused=1: task=%s scope integrity failure=%s', task_id, exception_code or category)
+                return False
             if rename_resume or promotion_resume:
                 resume_exc = exc
                 if promotion_resume:

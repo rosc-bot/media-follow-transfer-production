@@ -21,10 +21,12 @@ from app.ingest.resource_link_extractor import ResourceLinkExtractor
 from app.ingest.url_extractor import extract_urls
 from app.models.ingest import ChannelIngestJob, ChannelIngestMessage
 from app.models.resource import Resource
+from app.models.transfer import TransferQueueTask
 from app.models.watchlist import SeriesWatchlist
 from app.schemas.telegram_source import TelegramSourceMessage
 from app.transfer.normalization import share_hash
 from app.transfer.queue_service import TransferQueueService
+from app.transfer.status import REVIEW_STATUS
 
 
 class ChannelIngestService:
@@ -48,23 +50,117 @@ class ChannelIngestService:
         if source_type not in SOURCE_TYPES:
             raise ValueError(f'unsupported source_type: {source_type}')
         decision = decide_ingest(source_type=source_type, is_forward=source_msg.is_forward, setting=channel_setting)
-        existing = await db.scalar(select(ChannelIngestJob).where(ChannelIngestJob.channel_id == source_msg.channel_id, ChannelIngestJob.message_id == source_msg.message_id))
+        existing = await db.scalar(
+            select(ChannelIngestJob).where(
+                ChannelIngestJob.channel_id == source_msg.channel_id,
+                ChannelIngestJob.message_id == source_msg.message_id,
+            )
+        )
         if existing:
-            queue_reused = existing.transfer_status == 'QUEUED'
-            return {
-                'job_id': existing.id,
-                'status': existing.status,
-                'is_forward': existing.is_forward,
-                'deduplicated': True,
-                'queue_reused': queue_reused,
-                'transfer_status': existing.transfer_status,
-            }
+            # A Telegram message may contain a season pack and Scout invokes
+            # ingest once per missing episode using the same source message.
+            # Reuse is message+episode scoped, not message scoped.
+            old_episodes = set(canonical_episode_keys(existing.detected_episodes or [], season=existing.season))
+            new_episodes = set(canonical_episode_keys(
+                source_msg.metadata.get('episode_keys') or parse_episode_keys(f'{source_msg.text} {source_msg.caption}'),
+                season=source_msg.metadata.get('season') or existing.season,
+            ))
+            additional_episodes = new_episodes - old_episodes
+            incoming_urls = extract_urls(
+                f'{source_msg.text} {source_msg.caption}',
+                source_msg.entities,
+                source_msg.button_urls,
+            )
+            incoming_urls.extend(url for url in source_msg.urls if url not in incoming_urls)
+            incoming_share = source_msg.metadata.get('share_url') or (incoming_urls[0] if incoming_urls else None)
+            same_share = bool(incoming_share and share_hash(incoming_share) == existing.share_hash)
+            if not additional_episodes and same_share:
+                target_episodes = set(new_episodes)
+                source_resources = select(Resource.id).where(
+                    Resource.source_channel_id == source_msg.channel_id,
+                    Resource.source_message_id == source_msg.message_id,
+                    Resource.share_url == existing.share_url,
+                )
+                active_tasks = list((await db.scalars(
+                    select(TransferQueueTask).where(
+                        TransferQueueTask.resource_id.in_(source_resources),
+                        TransferQueueTask.status.in_(['QUEUED', 'RUNNING', 'RETRY_WAIT']),
+                    )
+                )).all())
+                reuse_task = next((
+                    task for task in active_tasks
+                    if target_episodes.intersection(canonical_episode_keys(
+                        (task.payload or {}).get('episode_keys') or [], season=existing.season,
+                    ))
+                ), None)
+                if reuse_task is not None:
+                    return {
+                        'job_id': existing.id,
+                        'resource_id': reuse_task.resource_id,
+                        'queue_task_id': reuse_task.id,
+                        'existing_task_id': reuse_task.id,
+                        'status': existing.status,
+                        'is_forward': existing.is_forward,
+                        'deduplicated': True,
+                        'queue_reused': True,
+                        'transfer_status': existing.transfer_status,
+                        'preflight_classification': (reuse_task.payload or {}).get('preflight_classification'),
+                        'queued_reactivated': bool((reuse_task.payload or {}).get('queued_reactivated')),
+                        'candidate_switched': bool((reuse_task.payload or {}).get('candidate_switched')),
+                        'stale_pending_recovered': bool((reuse_task.payload or {}).get('stale_pending_recovered')),
+                    }
+                pending_tasks = list((await db.scalars(
+                    select(TransferQueueTask).where(
+                        TransferQueueTask.resource_id.in_(source_resources),
+                        TransferQueueTask.status == REVIEW_STATUS,
+                    )
+                )).all())
+                review_task = next((
+                    task for task in pending_tasks
+                    if target_episodes.intersection(canonical_episode_keys(
+                        (task.payload or {}).get('episode_keys') or [], season=existing.season,
+                    ))
+                ), None)
+                if review_task is not None:
+                    review_payload = dict(review_task.payload or {})
+                    return {
+                        'job_id': existing.id,
+                        'resource_id': review_task.resource_id,
+                        'queue_task_id': review_task.id,
+                        'existing_task_id': review_task.id,
+                        'status': INGEST_NEEDS_REVIEW,
+                        'is_forward': existing.is_forward,
+                        'queued': False,
+                        'deduplicated': False,
+                        'queue_reused': False,
+                        'transfer_status': REVIEW_STATUS,
+                        'preflight_classification': review_payload.get('preflight_classification') or 'NEEDS_REVIEW',
+                        'preflight_reason': review_payload.get('preflight_reason'),
+                        'queued_reactivated': bool(review_payload.get('queued_reactivated')),
+                        'candidate_switched': bool(review_payload.get('candidate_switched')),
+                        'stale_pending_recovered': bool(review_payload.get('stale_pending_recovered')),
+                    }
+                return {
+                    'job_id': existing.id,
+                    'resource_id': None,
+                    'status': existing.status,
+                    'is_forward': existing.is_forward,
+                    'deduplicated': True,
+                    'queue_reused': False,
+                    'transfer_status': existing.transfer_status,
+                }
+            # Ingest only newly requested episode(s); never re-enqueue episodes
+            # already represented by this source message/job.
+            source_msg = source_msg.model_copy(update={
+                'metadata': {**source_msg.metadata, 'episode_keys': sorted(additional_episodes)},
+            })
         payload = source_msg.model_dump(mode='json')
         urls = extract_urls(f'{source_msg.text} {source_msg.caption}', source_msg.entities, source_msg.button_urls)
         urls.extend(x for x in source_msg.urls if x not in urls)
         share_url = source_msg.metadata.get('share_url') or (urls[0] if urls else None)
         raw_episodes = list(source_msg.metadata.get('episode_keys') or parse_episode_keys(f'{source_msg.text} {source_msg.caption}'))
         season, _ = parse_season_episode(f'{source_msg.text} {source_msg.caption}')
+        season = season or source_msg.metadata.get('season')
         episodes = canonical_episode_keys(raw_episodes, season=season)
         tmdb_id = source_msg.metadata.get('tmdb_id')
         title = source_msg.metadata.get('title') or clean_title(source_msg.text or source_msg.caption)
@@ -75,9 +171,22 @@ class ChannelIngestService:
                   'is_forward': bool(source_msg.is_forward), 'episode_keys': episodes,
                   'tmdb_id': tmdb_id, 'title': title, 'media_type': media_type,
                   'transfer_mode': 'AUTO' if decision.auto_transfer else 'MANUAL'}
-        db.add(ChannelIngestMessage(channel_id=source_msg.channel_id, message_id=source_msg.message_id,
-                                    source_type=source_type, is_forward=source_msg.is_forward,
-                                    payload=parsed, status='QUEUED'))
+        message_row = await db.scalar(select(ChannelIngestMessage).where(
+            ChannelIngestMessage.channel_id == source_msg.channel_id,
+            ChannelIngestMessage.message_id == source_msg.message_id,
+        ))
+        if message_row is None:
+            message_row = ChannelIngestMessage(channel_id=source_msg.channel_id, message_id=source_msg.message_id,
+                                               source_type=source_type, is_forward=source_msg.is_forward,
+                                               payload=parsed, status='QUEUED')
+            db.add(message_row)
+        else:
+            prior_payload = dict(message_row.payload or {})
+            prior_episodes = set(canonical_episode_keys(
+                prior_payload.get('episode_keys') or [], season=season,
+            ))
+            message_row.payload = {**prior_payload, **parsed,
+                                   'episode_keys': sorted(prior_episodes | set(episodes))}
         await db.flush()
         if not decision.accepted:
             job = ChannelIngestJob(channel_id=source_msg.channel_id, message_id=source_msg.message_id,
@@ -102,12 +211,29 @@ class ChannelIngestService:
             return {'job_id': job.id, 'status': job.status, 'is_forward': job.is_forward,
                     'skipped': 'unsupported_resource_link'}
         digest = share_hash(share_url)
-        job = ChannelIngestJob(channel_id=source_msg.channel_id, message_id=source_msg.message_id,
-                               source_type=source_type, is_forward=source_msg.is_forward, share_url=share_url,
-                               share_hash=digest, status=INGEST_NEEDS_REVIEW, parsed_data=parsed,
-                               media_type=media_type, tmdb_id=tmdb_id, title=title, season=season,
-                               detected_episodes=episodes)
-        db.add(job); await db.flush()
+        job = await db.scalar(select(ChannelIngestJob).where(
+            ChannelIngestJob.channel_id == source_msg.channel_id,
+            ChannelIngestJob.message_id == source_msg.message_id,
+            ChannelIngestJob.share_hash == digest,
+        ))
+        if job is None:
+            job = ChannelIngestJob(channel_id=source_msg.channel_id, message_id=source_msg.message_id,
+                                   source_type=source_type, is_forward=source_msg.is_forward, share_url=share_url,
+                                   share_hash=digest, status=INGEST_NEEDS_REVIEW, parsed_data=parsed,
+                                   media_type=media_type, tmdb_id=tmdb_id, title=title, season=season,
+                                   detected_episodes=episodes)
+            db.add(job)
+            await db.flush()
+        else:
+            prior_episodes = set(canonical_episode_keys(job.detected_episodes or [], season=season))
+            combined_episodes = sorted(prior_episodes | set(episodes))
+            job.detected_episodes = combined_episodes
+            job.parsed_data = {**dict(job.parsed_data or {}), **parsed, 'episode_keys': combined_episodes}
+            job.tmdb_id = int(tmdb_id) if tmdb_id is not None else job.tmdb_id
+            job.title = title or job.title
+            job.season = season or job.season
+            await db.flush()
+        episodes = sorted(set(episodes))
         identifiable = bool(tmdb_id and share_url and (episodes or media_type == 'movie'))
         if not identifiable:
             job.error_message = 'missing tmdb_id or season/episode identity'
@@ -144,6 +270,8 @@ class ChannelIngestService:
             return {'job_id': job.id, 'resource_id': resource.id, 'status': job.status, 'deduplicated': True, 'is_forward': job.is_forward}
         job.status = INGEST_COMPLETED; job.identity_status = 'IDENTIFIED'; job.ready_for_transfer = True
         job.transfer_status = 'QUEUED' if decision.auto_transfer else 'MANUAL'
+        queue_task_id = None
+        candidate_switched = False
         if decision.auto_transfer:
             enqueue_result = await TransferQueueService.enqueue_with_result(
                 db,
@@ -163,8 +291,34 @@ class ChannelIngestService:
                     'source_message_id': source_msg.message_id,
                     'is_forward': source_msg.is_forward,
                     'notification_chat_id': source_msg.metadata.get('notification_chat_id'),
+                    **({'selection_mode': 'MISSING_EPISODES'} if len(episodes) > 1 else {}),
                 },
             )
+            queue_task_id = enqueue_result.task.id
+            if enqueue_result.created:
+                stale_rows = list((await db.execute(
+                    select(TransferQueueTask, Resource)
+                    .join(Resource, Resource.id == TransferQueueTask.resource_id)
+                    .where(
+                        TransferQueueTask.status == REVIEW_STATUS,
+                        Resource.tmdb_id == int(tmdb_id),
+                        Resource.season == int(season or 1),
+                    )
+                )).all())
+                target_keys = set(canonical_episode_keys(episodes, season=season))
+                for stale_task, stale_resource in stale_rows:
+                    old_payload = dict(stale_task.payload or {})
+                    old_keys = set(canonical_episode_keys(
+                        old_payload.get('episode_keys') or ([stale_resource.episode_key] if stale_resource.episode_key else []),
+                        season=season,
+                    ))
+                    if (
+                        target_keys.intersection(old_keys)
+                        and stale_resource.share_url
+                        and share_hash(stale_resource.share_url) != digest
+                    ):
+                        candidate_switched = True
+                        break
             if enqueue_result.deduplicated:
                 job.ready_for_transfer = False
                 job.transfer_status = 'SKIPPED_DUPLICATE'
@@ -176,7 +330,8 @@ class ChannelIngestService:
                     'deduplicated_existing_task': True,
                     'queue_reused': False,
                     'existing_task_id': enqueue_result.task.id,
-                    'is_forward': job.is_forward,
+                    'queue_task_id': enqueue_result.task.id,
+                    'is_forward': source_msg.is_forward,
                 }
             if enqueue_result.reused:
                 return {
@@ -188,8 +343,32 @@ class ChannelIngestService:
                     'deduplicated_existing_task': False,
                     'queue_reused': True,
                     'existing_task_id': enqueue_result.task.id,
-                    'is_forward': job.is_forward,
+                    'queue_task_id': enqueue_result.task.id,
+                    'is_forward': source_msg.is_forward,
+                    'preflight_classification': (enqueue_result.task.payload or {}).get('preflight_classification'),
+                    'queued_reactivated': bool((enqueue_result.task.payload or {}).get('queued_reactivated')),
+                    'candidate_switched': bool((enqueue_result.task.payload or {}).get('candidate_switched')),
+                    'stale_pending_recovered': bool((enqueue_result.task.payload or {}).get('stale_pending_recovered')),
+                }
+            if str(enqueue_result.task.status) == REVIEW_STATUS:
+                job.status = INGEST_NEEDS_REVIEW
+                job.ready_for_transfer = False
+                job.transfer_status = REVIEW_STATUS
+                job.error_message = 'existing review task requires a new candidate or cloud-state change'
+                await db.flush()
+                return {
+                    'job_id': job.id,
+                    'resource_id': resource.id,
+                    'status': INGEST_NEEDS_REVIEW,
+                    'queued': False,
+                    'deduplicated': False,
+                    'queue_reused': False,
+                    'existing_task_id': enqueue_result.task.id,
+                    'queue_task_id': enqueue_result.task.id,
+                    'preflight_classification': 'NEEDS_REVIEW',
+                    'preflight_reason': 'EXISTING_PENDING_REQUIRES_NEW_EVIDENCE',
+                    'is_forward': source_msg.is_forward,
                 }
         await db.flush()
-        return {'job_id': job.id, 'resource_id': resource.id, 'status': job.status,
-                'queued': decision.auto_transfer, 'is_forward': job.is_forward}
+        return {'job_id': job.id, 'resource_id': resource.id, 'queue_task_id': queue_task_id, 'status': job.status,
+                'queued': decision.auto_transfer, 'candidate_switched': candidate_switched, 'is_forward': job.is_forward}

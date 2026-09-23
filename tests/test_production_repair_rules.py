@@ -326,6 +326,7 @@ def test_presence_planner_excludes_only_episodes_verified_in_all_ledgers():
         collected_episode_keys=["S01E01"],
         inventory_episode_keys=[1],
         cloud_episode_keys=["S01E01"],
+        cloud_scan_verified=True,
     )
 
     assert plan.classification == AUTO_SAFE
@@ -334,7 +335,7 @@ def test_presence_planner_excludes_only_episodes_verified_in_all_ledgers():
     assert plan.episode_file_map == {"S01E01": "e01", "S01E02": "e02", "S01E03": "e03"}
 
 
-def test_presence_planner_requires_collected_inventory_and_cloud_to_agree():
+def test_presence_planner_repairs_metadata_ledgers_from_verified_cloud_presence():
     plan = plan_missing_episode_transfer(
         _presence_share(),
         season=1,
@@ -342,11 +343,14 @@ def test_presence_planner_requires_collected_inventory_and_cloud_to_agree():
         collected_episode_keys=["S01E01"],
         inventory_episode_keys=[],
         cloud_episode_keys=["S01E01"],
+        cloud_scan_verified=True,
     )
 
-    assert plan.classification == NEEDS_REVIEW
-    assert plan.reason == "PRESENCE_LEDGER_MISMATCH:S01E01"
-    assert plan.missing_episode_keys == ()
+    assert plan.classification == AUTO_SAFE
+    assert plan.reason == "MISSING_EPISODES_CONFIRMED_BY_VERIFIED_CLOUD"
+    assert plan.missing_episode_keys == ("S01E02", "S01E03")
+    assert plan.presence_decisions["S01E01"]["classification"] == "PRESENT_CONFIRMED"
+    assert plan.metadata_reconcile == {"S01E01": ("inventory",)}
 
 
 def test_presence_planner_fails_closed_on_duplicate_or_unmapped_share_episodes():
@@ -374,6 +378,7 @@ def test_presence_planner_rejects_already_complete_and_reviews_active_or_complet
         collected_episode_keys=["S01E01", "S01E02", "S01E03"],
         inventory_episode_keys=[1, 2, 3],
         cloud_episode_keys=["S01E01", "S01E02", "S01E03"],
+        cloud_scan_verified=True,
     )
     active = plan_missing_episode_transfer(
         _presence_share(),
@@ -382,6 +387,7 @@ def test_presence_planner_rejects_already_complete_and_reviews_active_or_complet
         collected_episode_keys=["S01E01"],
         inventory_episode_keys=[1],
         cloud_episode_keys=["S01E01"],
+        cloud_scan_verified=True,
         active_episode_keys=["S01E02"],
     )
     completed = plan_missing_episode_transfer(
@@ -391,6 +397,7 @@ def test_presence_planner_rejects_already_complete_and_reviews_active_or_complet
         collected_episode_keys=["S01E01"],
         inventory_episode_keys=[1],
         cloud_episode_keys=["S01E01"],
+        cloud_scan_verified=True,
         completed_episode_keys=["S01E02"],
     )
 

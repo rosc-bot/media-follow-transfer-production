@@ -22,6 +22,8 @@ class MissingEpisodePlan:
     share_episode_keys: tuple[str, ...] = ()
     missing_episode_keys: tuple[str, ...] = ()
     episode_file_map: dict[str, str] = field(default_factory=dict)
+    presence_decisions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    metadata_reconcile: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -31,6 +33,8 @@ class MissingEpisodePlan:
             "share_episode_keys": list(self.share_episode_keys),
             "missing_episode_keys": list(self.missing_episode_keys),
             "episode_file_map": dict(self.episode_file_map),
+            "presence_decisions": {key: dict(value) for key, value in self.presence_decisions.items()},
+            "metadata_reconcile": {key: list(value) for key, value in self.metadata_reconcile.items()},
         }
 
 
@@ -52,8 +56,16 @@ def plan_missing_episode_transfer(
     cloud_episode_keys: list[object] | set[object] | tuple[object, ...],
     completed_episode_keys: list[object] | set[object] | tuple[object, ...] = (),
     active_episode_keys: list[object] | set[object] | tuple[object, ...] = (),
+    cloud_scan_verified: bool = False,
+    cloud_scan_truncated: bool = False,
+    cloud_pagination_complete: bool = True,
 ) -> MissingEpisodePlan:
-    """Return the exact missing set only when all three presence ledgers agree."""
+    """Plan batch restores only from a complete verified cloud listing.
+
+    Cloud is the physical-presence authority. Database ledgers may be repaired
+    from verified cloud evidence, but a DB-only presence with an absent cloud
+    file is a conflict and never authorizes restore.
+    """
     season_number = int(season)
     if season_number <= 0:
         return MissingEpisodePlan(REJECTED, "INVALID_SEASON", season_number)
@@ -89,22 +101,95 @@ def plan_missing_episode_transfer(
             tuple(share_keys),
         )
 
+    if not cloud_scan_verified or cloud_scan_truncated or not cloud_pagination_complete:
+        return MissingEpisodePlan(
+            NEEDS_REVIEW,
+            "CLOUD_UNVERIFIED",
+            season_number,
+            tuple(share_keys),
+        )
+
     collected = _keys(collected_episode_keys, season_number)
     inventory = _keys(inventory_episode_keys, season_number)
     cloud = _keys(cloud_episode_keys, season_number)
     completed = _keys(completed_episode_keys, season_number)
     active = _keys(active_episode_keys, season_number)
     missing: list[str] = []
+    presence_decisions: dict[str, dict[str, Any]] = {}
+    metadata_reconcile: dict[str, tuple[str, ...]] = {}
     for key in share_keys:
-        presence = (key in collected, key in inventory, key in cloud)
-        if len(set(presence)) != 1:
-            return MissingEpisodePlan(NEEDS_REVIEW, f"PRESENCE_LEDGER_MISMATCH:{key}", season_number, tuple(share_keys))
+        collected_present = key in collected
+        inventory_present = key in inventory
+        cloud_present = key in cloud
+        if cloud_present:
+            presence_decisions[key] = {
+                "classification": "PRESENT_CONFIRMED",
+                "cloud_present": True,
+                "collected_present": collected_present,
+                "inventory_present": inventory_present,
+            }
+            reconcile = tuple(
+                ledger
+                for ledger, present in (
+                    ("collected", collected_present),
+                    ("inventory", inventory_present),
+                )
+                if not present
+            )
+            if reconcile:
+                metadata_reconcile[key] = reconcile
+            continue
+
+        if key in completed:
+            presence_decisions[key] = {
+                "classification": "COMPLETED_TASK_WITHOUT_CLOUD_CLOSURE",
+                "cloud_present": False,
+                "collected_present": collected_present,
+                "inventory_present": inventory_present,
+            }
+            return MissingEpisodePlan(
+                NEEDS_REVIEW,
+                f"COMPLETED_TASK_WITHOUT_CLOUD_CLOSURE:{key}",
+                season_number,
+                tuple(share_keys),
+                presence_decisions=presence_decisions,
+            )
+        if collected_present or inventory_present:
+            presence_decisions[key] = {
+                "classification": "LEDGER_CONFLICT",
+                "cloud_present": False,
+                "collected_present": collected_present,
+                "inventory_present": inventory_present,
+            }
+            return MissingEpisodePlan(
+                NEEDS_REVIEW,
+                f"LEDGER_CONFLICT:{key}",
+                season_number,
+                tuple(share_keys),
+                presence_decisions=presence_decisions,
+            )
         if key in active:
-            return MissingEpisodePlan(NEEDS_REVIEW, f"ACTIVE_TRANSFER_OVERLAP:{key}", season_number, tuple(share_keys))
-        if key in completed and not all(presence):
-            return MissingEpisodePlan(NEEDS_REVIEW, f"COMPLETED_TASK_WITHOUT_CLOUD_CLOSURE:{key}", season_number, tuple(share_keys))
-        if not all(presence):
-            missing.append(key)
+            presence_decisions[key] = {
+                "classification": "ACTIVE_TRANSFER_OVERLAP",
+                "cloud_present": False,
+                "collected_present": False,
+                "inventory_present": False,
+            }
+            return MissingEpisodePlan(
+                NEEDS_REVIEW,
+                f"ACTIVE_TRANSFER_OVERLAP:{key}",
+                season_number,
+                tuple(share_keys),
+                presence_decisions=presence_decisions,
+            )
+        presence_decisions[key] = {
+            "classification": "MISSING_CONFIRMED",
+            "cloud_present": False,
+            "collected_present": False,
+            "inventory_present": False,
+        }
+        missing.append(key)
+
     if not missing:
         return MissingEpisodePlan(
             REJECTED,
@@ -113,14 +198,18 @@ def plan_missing_episode_transfer(
             tuple(share_keys),
             (),
             dict(selection.episode_file_map),
+            presence_decisions,
+            metadata_reconcile,
         )
     return MissingEpisodePlan(
         AUTO_SAFE,
-        "PRESENCE_LEDGERS_AGREE_AND_SHARE_MAP_IS_UNIQUE",
+        "MISSING_EPISODES_CONFIRMED_BY_VERIFIED_CLOUD",
         season_number,
         tuple(share_keys),
         tuple(missing),
         dict(selection.episode_file_map),
+        presence_decisions,
+        metadata_reconcile,
     )
 
 

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
+import socket
+import time
 from typing import ClassVar
 from urllib.parse import parse_qs, urlparse
 
@@ -32,11 +35,16 @@ from app.transfer.guangya_auth import (
     GuangyaAuthContext,
     GuangyaCredentialProvider,
     GuangyaCredentialStore,
+    _safe_exception_message,
+    _trace_stage,
     context_from_auth_ref,
     is_video_filename,
 )
 from app.transfer.rename import build_rename_plan
 from app.transfer.status import TransferOutcome
+
+logger = logging.getLogger(__name__)
+API_REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=6.0, read=10.0, write=5.0, pool=2.0)
 
 
 class GuangyaAdapter(BaseAdapter):
@@ -139,7 +147,57 @@ class GuangyaAdapter(BaseAdapter):
     # ------------------------------------------------------------------ #
 
     async def post(self, client: httpx.AsyncClient, url: str, payload: dict, headers: dict) -> dict:
-        response = await client.post(url, json=payload, headers=headers)
+        started = time.monotonic()
+        trace_state = {'stage': ''}
+
+        async def trace(event_name: str, _info: dict, _state=trace_state) -> None:
+            if str(event_name).endswith('.started'):
+                traced_stage = _trace_stage(event_name)
+                if traced_stage:
+                    _state['stage'] = traced_stage
+
+        try:
+            response = await client.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=API_REQUEST_TIMEOUT,
+                extensions={'trace': trace},
+            )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            if isinstance(exc, httpx.PoolTimeout):
+                stage = 'CONNECTION_POOL_WAIT'
+            elif isinstance(exc, httpx.WriteTimeout):
+                stage = 'REQUEST_WRITE'
+            elif isinstance(exc, httpx.ReadTimeout):
+                stage = 'RESPONSE_READ'
+            else:
+                stage = trace_state['stage'] or 'TCP_CONNECT'
+            if (
+                stage == 'TCP_CONNECT'
+                and isinstance(client, httpx.AsyncClient)
+                and isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError))
+            ):
+                host = urlparse(url).hostname
+                if host:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.get_running_loop().getaddrinfo(host, 443, type=socket.SOCK_STREAM),
+                            timeout=2.0,
+                        )
+                    except TimeoutError:
+                        stage = 'DNS_TIMEOUT'
+                    except OSError:
+                        stage = 'DNS_RESOLUTION'
+            elapsed_ms = round((time.monotonic() - started) * 1000)
+            logger.warning(
+                'Guangya request failed endpoint_type=api stage=%s elapsed_ms=%s exception_type=%s exception_message=%s',
+                stage,
+                elapsed_ms,
+                type(exc).__name__,
+                _safe_exception_message(exc),
+            )
+            raise
         response.raise_for_status()
         data = response.json()
         if not isinstance(data, dict) or not self.response_ok(data):

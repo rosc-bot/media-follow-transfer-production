@@ -325,20 +325,27 @@ class CloudInventoryService:
         tmdb_id: int,
         series_folder_name: str,
         completed_root_name: str | None = None,
+        destination_prefix: str | None = None,
+        relevant_seasons: list[int] | tuple[int, ...] | set[int] | None = None,
     ) -> dict[str, int]:
-        """Move logical inventory paths to completed without creating duplicates."""
+        """Move logical inventory paths to completed without dropping category layers."""
 
         rows = list((await db.scalars(select(CloudDiskInventory).where(
             CloudDiskInventory.tmdb_id == int(tmdb_id),
         ))).all())
-        prefix = str(series_folder_name or '').strip('/')
+        prefix = str(destination_prefix or series_folder_name or '').strip('/')
         if completed_root_name:
             prefix = f"{str(completed_root_name).strip('/')}/{prefix}".strip('/')
+        layout_seasons = None if relevant_seasons is None else {
+            int(value) for value in relevant_seasons if int(value) > 0
+        }
         changed = 0
         unchanged = 0
         for row in rows:
-            season_name = f"S{int(row.season):02d}"
-            final_path = f"{prefix}/{season_name}/{str(row.file_name).strip()}".strip('/')
+            season_name = f"S{int(row.season):02d}" if layout_seasons is None or len(layout_seasons) > 1 else None
+            final_path = "/".join(
+                part for part in (prefix, season_name, str(row.file_name).strip()) if part
+            )
             if row.rel_path == final_path:
                 unchanged += 1
                 continue

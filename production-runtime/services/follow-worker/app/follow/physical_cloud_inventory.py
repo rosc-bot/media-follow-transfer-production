@@ -64,6 +64,7 @@ class PhysicalCloudScanResult:
             "unparsed_video_count": self.unparsed_video_count,
             "error": self.error,
             "from_cache": self.from_cache,
+            "verified_files": [dict(item) for item in self._observed_files] if self.verified else [],
         }
 
 

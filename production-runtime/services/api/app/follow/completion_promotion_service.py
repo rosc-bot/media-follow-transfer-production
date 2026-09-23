@@ -10,9 +10,11 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.follow.episode_keys import canonical_episode_key
 from app.follow.physical_cloud_inventory import PhysicalCloudInventoryScanner
 from app.follow.promotion import PromotionDecision, evaluate_promotion
+from app.follow.tmdb_provider import TMDBSeasonProvider
 from app.models.cloud import CloudConfig, CloudDiskInventory
 from app.models.resource import Resource
 from app.models.transfer import TransferQueueTask
@@ -20,15 +22,9 @@ from app.models.watchlist import SeriesWatchlist
 from app.transfer.destination_routing import DestinationRouter
 from app.transfer.normalization import build_idempotency_key
 from app.transfer.queue_service import TransferQueueService
-from app.transfer.queue_worker import _series_layout_names
-from app.transfer.status import TransferStatus
+from app.transfer.status import EXECUTION_ACTIVE_STATUSES
 
-_ACTIVE_TRANSFER_STATUSES = frozenset({
-    str(TransferStatus.QUEUED),
-    str(TransferStatus.RETRY_WAIT),
-    str(TransferStatus.RUNNING),
-    "PENDING",
-})
+_ACTIVE_TRANSFER_STATUSES = EXECUTION_ACTIVE_STATUSES
 
 
 class CompletionPromotionService:
@@ -39,6 +35,22 @@ class CompletionPromotionService:
             Resource.season == season,
             Resource.cloud_name.is_not(None),
         ).order_by(Resource.id.desc()))
+
+    @staticmethod
+    async def _tmdb_metadata(resource: Resource) -> dict[str, Any] | None:
+        cached = getattr(resource, 'tmdb_metadata', None)
+        if isinstance(cached, dict) and cached.get('id'):
+            return dict(cached)
+        if not resource.tmdb_id:
+            return None
+        settings = get_settings()
+        try:
+            return await TMDBSeasonProvider(
+                api_key=settings.tmdb_api_key,
+                base_url=settings.tmdb_base_url,
+            ).fetch_details(int(resource.tmdb_id), str(resource.media_type or 'tv'))
+        except Exception:  # noqa: BLE001 - promotion must remain fail-closed
+            return None
 
     @staticmethod
     async def _active_transfer_count(db: AsyncSession, *, tmdb_id: int, season: int) -> int:
@@ -313,19 +325,21 @@ class CompletionPromotionService:
             cloud_config = await db.scalar(select(CloudConfig).where(CloudConfig.name == provider))
             if cloud_config is None or not cloud_config.enabled:
                 continue
+            metadata = await CompletionPromotionService._tmdb_metadata(resource)
+            if metadata is None:
+                continue
             route = DestinationRouter.resolve(
                 resource=resource,
                 cloud_config=cloud_config,
                 watchlist=watchlist,
                 incoming_episode_keys=[],
+                metadata=metadata,
                 operation='promote',
                 physical_complete=True,
             )
-            if route.kind != 'completed':
+            if route.kind != 'completed' or route.destination is None:
                 continue
-            layout = _series_layout_names(resource, watchlist, route.kind)
-            if layout is None:
-                continue
+            destination = route.destination
             promotion_key = build_idempotency_key(resource.id, provider, ['promotion'])
             exists = await db.scalar(select(TransferQueueTask.id).where(
                 TransferQueueTask.idempotency_key == promotion_key,
@@ -346,8 +360,16 @@ class CompletionPromotionService:
                     'ongoing_root_id': cloud_config.ongoing_target_folder_id,
                     'destination_kind': route.kind,
                     'promotion_source_series_folder_id': watchlist.remote_series_folder_id,
-                    'series_folder_name': layout[0],
-                    'season_folder_name': layout[1],
+                    'media_root': destination.media_root,
+                    'media_category': destination.media_category,
+                    'sub_category': destination.media_category,
+                    'series_folder_name': destination.item_name,
+                    'season_folder_name': destination.season_name,
+                    'destination_prefix': destination.relative_item_path,
+                    'inventory_prefix': destination.inventory_prefix,
+                    'remote_rel_path_prefix': destination.inventory_prefix,
+                    'archive_directory': destination.archive_directory,
+                    'category_resolution': destination.resolution.as_dict(),
                     'tmdb_id': watchlist.tmdb_id,
                     'title': watchlist.title,
                 },

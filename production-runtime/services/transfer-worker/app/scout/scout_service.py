@@ -50,6 +50,16 @@ def _empty_stats() -> dict:
         'deduplicated_existing_tasks': 0,
         'queue_reused': 0,
         'needs_review': 0,
+        'missing_total': 0,
+        'missing_with_local_candidate': 0,
+        'missing_with_framehdr_candidate': 0,
+        'auto_safe': 0,
+        'pending_review': 0,
+        'no_resource': 0,
+        'queued_new': 0,
+        'queued_reactivated': 0,
+        'candidate_switched': 0,
+        'stale_pending_recovered': 0,
     }
 
 
@@ -127,7 +137,10 @@ class ScoutService:
         results: list[dict] = []
         still_missing: list[dict] = []
 
-        # 1. Local message-store scouting (fast, per-episode search).
+        # 1. Local message-store scouting. Group missing episodes that resolve
+        # to the same source message/share before ingest so one season pack can
+        # create one multi-episode resource/task rather than one task per key.
+        selected_groups: dict[tuple[str, int, str], dict] = {}
         for episode_key in missing_episodes:
             candidates = self.search.search(title, episode_key)
             explanation = CandidateSelector.explain(candidates, title=title, episode_key=episode_key)
@@ -142,8 +155,6 @@ class ScoutService:
                 'final_status': FINAL_NO_RESOURCE,
                 'outcome': LOCAL_MATCH if chosen else LOCAL_NO_MATCH,
             }
-            # Phase 2C §五: persist EVERY local candidate (not just the chosen
-            # URL) — idempotent per tmdb/season/episode/share_hash.
             for candidate in candidates:
                 matched_url = getattr(candidate, 'url', None)
                 if not matched_url:
@@ -159,8 +170,28 @@ class ScoutService:
                 still_missing.append(entry)
                 results.append(entry)
                 continue
+
             selected = chosen[0].message
-            share_url = choice_url = chosen[0].matched_url
+            share_url = chosen[0].matched_url
+            group_key = (
+                str(getattr(selected, 'chat_id', '')),
+                int(getattr(selected, 'message_id', 0) or 0),
+                str(share_url or ''),
+            )
+            group = selected_groups.setdefault(group_key, {
+                'message': selected,
+                'share_url': share_url,
+                'episode_keys': [],
+                'entries': [],
+            })
+            group['episode_keys'].append(episode_key)
+            group['entries'].append(entry)
+            results.append(entry)
+
+        for group in selected_groups.values():
+            selected = group['message']
+            episode_keys = list(dict.fromkeys(group['episode_keys']))
+            share_url = group['share_url']
             source = TelegramSourceMessage(
                 source_type=SOURCE_WATCHLIST_SCOUT,
                 channel_id=str(getattr(selected, 'chat_id', '')),
@@ -169,37 +200,38 @@ class ScoutService:
                 text=getattr(selected, 'text', ''),
                 urls=getattr(selected, 'urls', []),
                 metadata={'tmdb_id': tmdb_id, 'title': title, 'year': year, 'season': season,
-                          'episode_keys': [episode_key], 'share_url': share_url,
+                          'episode_keys': episode_keys, 'share_url': share_url,
                           'source_channel_id': str(getattr(selected, 'chat_id', '')),
                           'source_message_id': int(getattr(selected, 'message_id', 0) or 0)},
             )
             try:
                 ingest = await ChannelIngestService.process_source_message(db, source)
             except Exception as exc:  # noqa: BLE001 - local ingest failures are recorded, never fatal
-                logger.warning('Ingest failed for %s %s from %s: %s', title, episode_key, source.channel_id, exc)
-                entry.update({
-                    'final_status': FINAL_NEEDS_REVIEW,
-                    'outcome': NEEDS_REVIEW,
-                    'ingest_error': str(exc)[:300],
-                })
-                results.append(entry)
+                logger.warning('Ingest failed for %s %s from %s: %s', title, ','.join(episode_keys), source.channel_id, exc)
+                for entry in group['entries']:
+                    entry.update({
+                        'final_status': FINAL_NEEDS_REVIEW,
+                        'outcome': NEEDS_REVIEW,
+                        'ingest_error': str(exc)[:300],
+                    })
                 continue
-            entry.update(ingest)
-            self._apply_ingest_outcome(entry, ingest)
-            entry['chosen_url'] = choice_url
-            # Phase 2C §五: link the chosen candidate to its resource & task.
-            if choice_url:
+
+            task_id = ingest.get('queue_task_id') or ingest.get('existing_task_id')
+            for entry in group['entries']:
+                entry.update(ingest)
+                self._apply_ingest_outcome(entry, ingest)
+                entry['chosen_url'] = share_url
                 chosen_candidate = await self._persist_candidate(
                     db,
                     tmdb_id=tmdb_id, title=title, year=year, season=season,
-                    episode_key=episode_key, share_url=choice_url,
-                    source_channel_id=str(getattr(selected, 'chat_id', '')),
-                    source_message_id=int(getattr(selected, 'message_id', 0) or 0),
+                    episode_key=entry['episode_key'], share_url=share_url,
+                    source_channel_id=source.channel_id,
+                    source_message_id=source.message_id,
                     resource_id=ingest.get('resource_id'),
+                    queue_task_id=task_id,
                 )
-                if ingest.get('queued'):
-                    await mark_candidate_used(db, candidate=chosen_candidate)
-            results.append(entry)
+                if ingest.get('queued') or ingest.get('queue_reused'):
+                    await mark_candidate_used(db, candidate=chosen_candidate, queue_task_id=task_id)
 
         # 2. FrameHDR fallback: ONE batched call for all still-missing episodes.
         if not still_missing:
@@ -221,12 +253,15 @@ class ScoutService:
                     limit=2,
                 )
                 matched_in_batch: set[int] = set()
+                episode_to_share: dict[int, dict] = {}
                 for fh in fh_results:
-                    matched_in_batch.update(fh.get('matched_episodes') or [])
-                    # Phase 2C §五: persist EVERY FrameHDR share as a candidate.
+                    matched_episodes = set(fh.get('matched_episodes') or [])
+                    matched_in_batch.update(matched_episodes)
+                    # Persist every discovered share at episode granularity,
+                    # even when another share is selected for queueing.
                     fh_url = fh.get('url')
                     if fh_url:
-                        for fh_ep in (fh.get('matched_episodes') or []) or batch:
+                        for fh_ep in matched_episodes or batch:
                             await self._persist_candidate(
                                 db,
                                 tmdb_id=tmdb_id, title=title, year=year, season=season,
@@ -234,51 +269,76 @@ class ScoutService:
                                 share_url=fh_url,
                                 source_channel_id='framehdr',
                                 source_message_id=int(fh.get('msg_id') or 800000001),
-                                source_type='framehdr',
+                                source_type=SOURCE_FRAMEHDR,
                             )
+                    for fh_ep in matched_episodes:
+                        episode_to_share.setdefault(fh_ep, fh)
+
+                groups: dict[tuple[str, int], dict] = {}
                 for missing_entry in still_missing:
                     episode_key = missing_entry['episode_key']
-                    m = re.search(r'E(\d+)', episode_key, re.IGNORECASE)
-                    ep_num = int(m.group(1)) if m else None
+                    match = re.search(r'E(\d+)', episode_key, re.IGNORECASE)
+                    ep_num = int(match.group(1)) if match else None
                     if ep_num is None:
                         continue
                     entry = next(s for s in results if s['episode_key'] == episode_key)
-                    # Layered framehdr stage — local_status stays untouched.
-                    entry['framehdr_status'] = (
-                        FRAMEHDR_MATCH if ep_num in matched_in_batch else FRAMEHDR_NO_MATCH
-                    )
-                    if ep_num not in matched_in_batch:
+                    entry['framehdr_status'] = FRAMEHDR_MATCH if ep_num in matched_in_batch else FRAMEHDR_NO_MATCH
+                    fh = episode_to_share.get(ep_num)
+                    if fh is None or not fh.get('url'):
                         continue
-                    fh = next((f for f in fh_results if ep_num in (f.get('matched_episodes') or [])), None)
-                    if fh is None:
-                        entry['framehdr_status'] = FRAMEHDR_NO_MATCH
-                        continue
-                    episode_key_full = f'S{season:02d}E{ep_num:02d}'
+                    group_key = (str(fh['url']), int(fh.get('msg_id') or 800000001))
+                    group = groups.setdefault(group_key, {'share': fh, 'episode_keys': [], 'entries': []})
+                    full_episode_key = f'S{season:02d}E{ep_num:02d}'
+                    group['episode_keys'].append(full_episode_key)
+                    group['entries'].append(entry)
+
+                for group in groups.values():
+                    fh = group['share']
+                    episode_keys = list(dict.fromkeys(group['episode_keys']))
                     source = TelegramSourceMessage(
                         source_type=SOURCE_FRAMEHDR,
                         channel_id='framehdr',
                         channel_title=fh.get('chat_title') or '帧影分享',
                         message_id=fh.get('msg_id') or 800000001,
-                        text=fh.get('snippet') or f'[帧影分享] {title} {episode_key_full}',
-                        urls=[fh['url']] if fh.get('url') else [],
+                        text=fh.get('snippet') or f'[帧影分享] {title} {", ".join(episode_keys)}',
+                        urls=[fh['url']],
                         metadata={'tmdb_id': tmdb_id, 'title': title, 'year': year, 'season': season,
-                                  'episode_keys': [episode_key_full], 'share_url': fh.get('url'),
+                                  'episode_keys': episode_keys, 'share_url': fh['url'],
                                   'provider': fh.get('provider') or 'guangya'},
                     )
                     try:
                         ingest = await ChannelIngestService.process_source_message(db, source)
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning('FrameHdr ingest failed for %s %s: %s', title, episode_key_full, exc)
-                        entry.update({
-                            'final_status': FINAL_NEEDS_REVIEW,
-                            'outcome': NEEDS_REVIEW,
-                            'chosen_url': fh.get('url'),
-                            'ingest_error': str(exc)[:300],
-                        })
+                        logger.warning('FrameHdr ingest failed for %s %s: %s', title, ','.join(episode_keys), exc)
+                        for entry in group['entries']:
+                            entry.update({
+                                'final_status': FINAL_NEEDS_REVIEW,
+                                'outcome': NEEDS_REVIEW,
+                                'chosen_url': fh.get('url'),
+                                'ingest_error': str(exc)[:300],
+                            })
                         continue
-                    entry.update(ingest)
-                    self._apply_ingest_outcome(entry, ingest)
-                    entry['chosen_url'] = fh.get('url')
+                    task_id = ingest.get('queue_task_id') or ingest.get('existing_task_id')
+                    for entry in group['entries']:
+                        entry.update(ingest)
+                        self._apply_ingest_outcome(entry, ingest)
+                        entry['chosen_url'] = fh.get('url')
+                        selected_candidate = await self._persist_candidate(
+                            db,
+                            tmdb_id=tmdb_id,
+                            title=title,
+                            year=year,
+                            season=season,
+                            episode_key=entry['episode_key'],
+                            share_url=fh['url'],
+                            source_channel_id='framehdr',
+                            source_message_id=int(fh.get('msg_id') or 800000001),
+                            source_type=SOURCE_FRAMEHDR,
+                            resource_id=ingest.get('resource_id'),
+                            queue_task_id=task_id,
+                        )
+                        if ingest.get('queued') or ingest.get('queue_reused'):
+                            await mark_candidate_used(db, candidate=selected_candidate, queue_task_id=task_id)
         except (TimeoutError, aiohttp.ClientError, RuntimeError, ValueError) as exc:
             logger.warning('FrameHdr search failed for %s S%02d: %s', title, season, exc)
             for entry in results:
@@ -299,10 +359,14 @@ class ScoutService:
         FrameHDR fallback can never zero them (2B bug fixed).
         """
         stats = _empty_stats()
+        new_task_ids: set[str] = set()
+        new_tasks_without_id = 0
         for entry in results:
             stats['target_episodes'] += 1
+            stats['missing_total'] += 1
             if entry.get('local_status') == LOCAL_MATCH:
                 stats['local_hit'] += 1
+                stats['missing_with_local_candidate'] += 1
             elif entry.get('local_status') == LOCAL_NO_MATCH:
                 stats['local_miss'] += 1
             fh_status = entry.get('framehdr_status')
@@ -310,16 +374,33 @@ class ScoutService:
                 stats['framehdr_attempted'] += 1
             if fh_status == FRAMEHDR_MATCH:
                 stats['framehdr_hit'] += 1
+                stats['missing_with_framehdr_candidate'] += 1
             elif fh_status == FRAMEHDR_NO_MATCH:
                 stats['framehdr_miss'] += 1
             if entry.get('transfer_eligible'):
                 stats['transfer_eligible'] += 1
             if entry.get('new_queue_task_created'):
-                stats['new_queue_tasks_created'] += 1
+                task_id = entry.get('queue_task_id') or entry.get('existing_task_id')
+                if task_id is None:
+                    new_tasks_without_id += 1
+                else:
+                    new_task_ids.add(str(task_id))
             if entry.get('deduplicated_existing_task'):
                 stats['deduplicated_existing_tasks'] += 1
             if entry.get('queue_reused'):
                 stats['queue_reused'] += 1
             if entry.get('final_status') == FINAL_NEEDS_REVIEW:
                 stats['needs_review'] += 1
+            classification = str(entry.get('preflight_classification') or '').upper()
+            if classification == 'AUTO_SAFE':
+                stats['auto_safe'] += 1
+            if classification == 'NEEDS_REVIEW' or entry.get('final_status') == FINAL_NEEDS_REVIEW:
+                stats['pending_review'] += 1
+            if entry.get('final_status') == FINAL_NO_RESOURCE:
+                stats['no_resource'] += 1
+            for key in ('queued_reactivated', 'candidate_switched', 'stale_pending_recovered'):
+                if entry.get(key):
+                    stats[key] += 1
+        stats['new_queue_tasks_created'] = len(new_task_ids) + new_tasks_without_id
+        stats['queued_new'] = stats['new_queue_tasks_created']
         return stats

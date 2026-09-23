@@ -8,17 +8,20 @@ file ID before any provider write is possible.
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from app.transfer.episode_matcher import diagnose_episode_match
+from app.follow.episode_keys import canonical_episode_key
+from app.transfer.episode_matcher import diagnose_episode_match, extract_video_episode_keys
 from app.transfer.errors import FileSelectionError, TransferErrorCategory
 from app.transfer.guangya_auth import is_video_filename
 
 
 class SelectionMode(StrEnum):
     SINGLE_EPISODE = "SINGLE_EPISODE"
+    MISSING_EPISODES = "MISSING_EPISODES"
     WHOLE_SHARE = "WHOLE_SHARE"
     COLLECTION = "COLLECTION"
 
@@ -38,6 +41,9 @@ class FileSelectionResult:
     selected_file_names: list[str] = field(default_factory=list)
     rejected_files: list[dict[str, Any]] = field(default_factory=list)
     decision: str = ""
+    requested_episode_keys: list[str] = field(default_factory=list)
+    selected_episode_keys: list[str] = field(default_factory=list)
+    episode_file_map: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -193,6 +199,10 @@ def select_files(
     matched_ids = [item["file_id"] for item in matched_unique_items if item["file_id"]]
 
     selected: list[dict[str, Any]] = []
+    selected_episode_keys: list[str] = []
+    episode_file_map: dict[str, str] = {}
+    requested_episode_keys: list[str] = []
+    batch_matched_items: list[dict[str, Any]] = []
     decision = ""
     if mode is SelectionMode.SINGLE_EPISODE:
         if matched_unique_items == []:
@@ -202,9 +212,91 @@ def select_files(
         else:
             selected = matched_unique_items
             decision = "EXACT_SINGLE_EPISODE"
+            if target:
+                canonical_target = canonical_episode_key(season, target)
+                if canonical_target:
+                    requested_episode_keys = [canonical_target]
+                    selected_episode_keys = [canonical_target]
+                    episode_file_map = {canonical_target: selected[0]["file_id"]}
+    elif mode is SelectionMode.MISSING_EPISODES:
+        for value in episode_keys:
+            key = canonical_episode_key(season, value)
+            if key and key not in requested_episode_keys:
+                requested_episode_keys.append(key)
+        if not requested_episode_keys or len(requested_episode_keys) != len(episode_keys):
+            decision = "FILE_SELECTION_REVIEW"
+        else:
+            by_episode: dict[str, dict[str, Any]] = {}
+            ambiguous = False
+            for item in unique_files:
+                name = item["name"]
+                # Ranges and multi-episode files cannot be safely split by restore.
+                if re.search(
+                    r"(?i)\bS\d{1,3}[ ._-]*E\d{1,4}[ ._-]*(?:-|~|到|至)[ ._-]*(?:E)?\d{1,4}\b",
+                    name,
+                ):
+                    ambiguous = True
+                    break
+                parsed_keys = extract_video_episode_keys(name, known_season=season)
+                if len(parsed_keys) != 1 or not item["file_id"]:
+                    ambiguous = True
+                    break
+                key = parsed_keys[0]
+                if season is not None and int(key[1:3]) != int(season):
+                    ambiguous = True
+                    break
+                previous = by_episode.get(key)
+                if previous is not None and previous["file_id"] != item["file_id"]:
+                    ambiguous = True
+                    break
+                by_episode[key] = item
+            if ambiguous:
+                decision = "FILE_SELECTION_REVIEW"
+            else:
+                missing = [key for key in requested_episode_keys if key not in by_episode]
+                batch_matched_items = [by_episode[key] for key in requested_episode_keys if key in by_episode]
+                matched_ids = [item["file_id"] for item in batch_matched_items if item["file_id"]]
+                matched_listing_count = sum(
+                    1
+                    for item in raw_video_files
+                    if set(extract_video_episode_keys(item["name"], known_season=season)) & set(requested_episode_keys)
+                )
+                duplicate_names = [
+                    key for key in requested_episode_keys
+                    if key in by_episode and sum(
+                        1 for value in by_episode.values() if value["name"] == by_episode[key]["name"]
+                    ) > 1
+                ]
+                if duplicate_names:
+                    decision = "FILE_SELECTION_REVIEW"
+                elif missing:
+                    decision = "EPISODE_MISMATCH"
+                else:
+                    selected_episode_keys = list(requested_episode_keys)
+                    selected = [by_episode[key] for key in selected_episode_keys]
+                    episode_file_map = {key: by_episode[key]["file_id"] for key in selected_episode_keys}
+                    decision = "MISSING_EPISODES"
     elif mode is SelectionMode.WHOLE_SHARE:
         selected = unique_files
         decision = "WHOLE_SHARE"
+        if season is not None:
+            by_episode: dict[str, dict[str, Any]] = {}
+            for item in selected:
+                keys = extract_video_episode_keys(item["name"], known_season=season)
+                if len(keys) != 1 or not item["file_id"] or int(keys[0][1:3]) != int(season):
+                    decision = "FILE_SELECTION_REVIEW"
+                    selected = []
+                    break
+                key = keys[0]
+                if key in by_episode:
+                    decision = "FILE_SELECTION_REVIEW"
+                    selected = []
+                    break
+                by_episode[key] = item
+            if decision == "WHOLE_SHARE":
+                selected_episode_keys = list(by_episode)
+                requested_episode_keys = list(selected_episode_keys)
+                episode_file_map = {key: item["file_id"] for key, item in by_episode.items()}
     else:
         requested_ids = {str(value).strip() for value in (selected_file_ids or []) if str(value).strip()}
         requested_names = {str(value).strip() for value in (selected_file_names or []) if str(value).strip()}
@@ -237,13 +329,16 @@ def select_files(
         share_video_count=len(raw_video_files),
         unique_video_count=len(unique_files),
         matched_listing_count=matched_listing_count,
-        matched_unique_file_count=len(matched_unique_items),
+        matched_unique_file_count=len(batch_matched_items) if mode is SelectionMode.MISSING_EPISODES else len(matched_unique_items),
         unique_file_ids=unique_file_ids,
         matched_file_ids=matched_ids,
         selected_file_ids=selected_ids,
         selected_file_names=selected_names,
         rejected_files=_rejected_files(unique_files, unique_diagnostics or raw_diagnostics, set(selected_ids)),
         decision=decision,
+        requested_episode_keys=requested_episode_keys,
+        selected_episode_keys=selected_episode_keys,
+        episode_file_map=episode_file_map,
     )
     return result
 
@@ -275,6 +370,36 @@ def assert_selection_scope(result: FileSelectionResult) -> FileSelectionResult:
                 "TRANSFER_SCOPE_VIOLATION",
                 "selected file IDs are not a subset of matched episode file IDs",
                 category=TransferErrorCategory.TRANSFER_SCOPE_VIOLATION,
+            )
+    elif result.selection_mode is SelectionMode.MISSING_EPISODES:
+        if result.decision == "FILE_SELECTION_REVIEW":
+            raise FileSelectionError(
+                "FILE_SELECTION_REVIEW",
+                "share episode map is ambiguous or contains a multi-episode file",
+            )
+        if result.decision == "EPISODE_MISMATCH":
+            raise FileSelectionError(
+                "EPISODE_MISMATCH",
+                "share does not contain one unique file for every requested missing episode",
+                category=TransferErrorCategory.EPISODE_MISMATCH,
+            )
+        requested = list(result.requested_episode_keys)
+        mapping = dict(result.episode_file_map)
+        expected_ids = [mapping.get(key, "") for key in requested]
+        if (
+            result.decision != "MISSING_EPISODES"
+            or not requested
+            or result.selected_episode_keys != requested
+            or set(mapping) != set(requested)
+            or not all(expected_ids)
+            or selected != expected_ids
+            or len(selected) != len(set(selected))
+            or len(result.selected_file_names) != len(requested)
+            or not set(selected).issubset(unique)
+        ):
+            raise FileSelectionError(
+                "MISSING_EPISODE_SELECTION_INVALID",
+                "selected IDs must map one-to-one to every requested missing episode",
             )
     elif result.selection_mode is SelectionMode.WHOLE_SHARE:
         if not selected or set(selected) != unique:

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.follow.episode_keys import canonical_episode_key
@@ -10,7 +10,7 @@ from app.models.resource import Resource
 from app.models.transfer import TransferQueueTask
 from app.transfer.errors import NON_RETRYABLE_CATEGORIES, TransferErrorCategory
 from app.transfer.normalization import build_idempotency_key
-from app.transfer.status import SUCCESS_TERMINAL_STATUSES, TransferStatus
+from app.transfer.status import REVIEW_STATUS, SUCCESS_TERMINAL_STATUSES, TransferStatus
 
 
 @dataclass(frozen=True)
@@ -88,7 +88,13 @@ class TransferQueueService:
         existing = await db.scalar(select(TransferQueueTask).where(TransferQueueTask.idempotency_key == key))
         if existing is not None:
             is_success = str(existing.status) in {str(value) for value in SUCCESS_TERMINAL_STATUSES}
-            return EnqueueResult(existing, created=False, reused=not is_success, deduplicated=is_success)
+            is_review = str(existing.status) == REVIEW_STATUS
+            return EnqueueResult(
+                existing,
+                created=False,
+                reused=not is_success and not is_review,
+                deduplicated=is_success,
+            )
 
         resource = await db.get(Resource, resource_id)
         tmdb_id = payload.get('tmdb_id') or (resource.tmdb_id if resource else None)
@@ -134,8 +140,13 @@ class TransferQueueService:
     @staticmethod
     async def claim_next(db: AsyncSession, *, worker_id: str) -> TransferQueueTask | None:
         now = datetime.now(UTC)
+        preflight_classification = TransferQueueTask.payload['preflight_classification'].as_string()
         stmt = (select(TransferQueueTask)
-                .where(TransferQueueTask.status.in_([TransferStatus.QUEUED, TransferStatus.RETRY_WAIT]), TransferQueueTask.next_run_at <= now)
+                .where(
+                    TransferQueueTask.status.in_([TransferStatus.QUEUED, TransferStatus.RETRY_WAIT]),
+                    TransferQueueTask.next_run_at <= now,
+                    or_(preflight_classification.is_(None), preflight_classification == 'AUTO_SAFE'),
+                )
                 .order_by(TransferQueueTask.priority.asc(), TransferQueueTask.id.asc())
                 .with_for_update(skip_locked=True).limit(1))
         task = (await db.execute(stmt)).scalar_one_or_none()

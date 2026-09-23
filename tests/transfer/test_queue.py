@@ -37,6 +37,36 @@ async def test_enqueue_is_idempotent_and_worker_verifies(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_pending_review_row_is_not_reported_as_reused_active_transfer(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/pending-enqueue.db")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with sessions() as db, db.begin():
+        review = await TransferQueueService.enqueue(
+            db,
+            resource_id=807,
+            provider="guangya",
+            payload={"episode_keys": ["S01E07"]},
+            episode_keys=["S01E07"],
+        )
+        review.status = "PENDING"
+        result = await TransferQueueService.enqueue_with_result(
+            db,
+            resource_id=807,
+            provider="guangya",
+            payload={"episode_keys": ["S01E07"]},
+            episode_keys=["S01E07"],
+        )
+
+        assert result.task.id == review.id
+        assert result.reused is False
+        assert result.deduplicated is False
+        assert result.task.status == "PENDING"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_worker_hydrates_missing_fields_from_resource_and_cloud_config(tmp_path, monkeypatch):
     from app.models.cloud import CloudConfig
     from app.models.resource import Resource
