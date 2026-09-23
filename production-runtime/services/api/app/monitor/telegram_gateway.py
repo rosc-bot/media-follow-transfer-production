@@ -106,6 +106,10 @@ class TelegramGateway:
         async def on_new_message(event):
             await self.router.route_event(event, client=self.client)
 
+        @self.client.on(events.MessageEdited())
+        async def on_message_edited(event):
+            await self.router.route_event(event, client=self.client)
+
         await self.client.start()
         me = await self.client.get_me()
         logger.info("TelegramClient connected successfully as %s (@%s)", getattr(me, "first_name", ""), getattr(me, "username", ""))

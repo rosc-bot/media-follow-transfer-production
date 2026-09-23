@@ -40,6 +40,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+    volumes:
+      - ./data:/app/data:ro
 
   bot:
     build:
@@ -72,11 +74,16 @@ services:
       - ./data:/app/data
 
   resource-monitor:
-    build: .
+    build:
+      context: .
+      args:
+        RELEASE_COMMIT: ${RELEASE_COMMIT:-unknown}
     restart: unless-stopped
     env_file: .env
     environment:
       TZ: Asia/Shanghai
+      CLOUD_WRITE_ENABLED: "false"
+      RELEASE_COMMIT: ${RELEASE_COMMIT:-unknown}
     command: python -m app.workers.resource_monitor_worker
     depends_on:
       migrate:

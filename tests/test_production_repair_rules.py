@@ -141,6 +141,7 @@ class _SeriesRootAdapter(GuangyaAdapter):
         self.calls = []
         self.tree = {
             "root": [{"fileId": "media", "name": "电视剧", "resType": 2}],
+            "completed-root": [],
             "media": [{"fileId": "category", "name": "日番", "resType": 2}],
             "category": existing_series,
         }
@@ -171,6 +172,9 @@ async def _prepare_series(adapter):
                 "media_category": "日番",
                 "media_type": "tv",
                 "tmdb_id": 223564,
+                "destination_kind": "ongoing",
+                "ongoing_root_id": "root",
+                "completed_root_id": "completed-root",
             },
             root_id="root",
             ctx=context_from_auth_ref("access-token"),
@@ -196,8 +200,9 @@ async def test_multiple_directories_with_same_tmdb_identity_fail_closed():
         {"fileId": "series-b", "name": "Title B (2023) 4K {tmdbid-223564}", "resType": 2},
     ])
 
-    with pytest.raises(RuntimeError, match="DUPLICATE_TMDB_ROOT"):
+    with pytest.raises(FileSelectionError) as exc:
         await _prepare_series(adapter)
+    assert exc.value.code == "DUPLICATE_TMDB_ROOT"
     assert not any(url.endswith("/file/create_dir") for url, _ in adapter.calls)
 
 
@@ -425,7 +430,7 @@ async def test_physical_scan_uses_paginated_readback_without_trusting_sticky_has
             self.calls.append((url, dict(payload)))
             page = int(payload.get("page") or 0)
             items = self.files if page == 0 else []
-            return {"code": 0, "data": {"list": items, "hasMore": True}}
+            return {"code": 0, "data": {"list": items, "total": 3, "hasMore": True}}
 
     adapter = StickyHasMoreAdapter()
     scan = await adapter.scan_series_root_readonly(

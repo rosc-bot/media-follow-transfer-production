@@ -192,6 +192,20 @@ class ScoutService:
             selected = group['message']
             episode_keys = list(dict.fromkeys(group['episode_keys']))
             share_url = group['share_url']
+            source_metadata = {
+                'tmdb_id': tmdb_id,
+                'title': title,
+                'year': year,
+                'season': season,
+                'episode_keys': episode_keys,
+                'share_url': share_url,
+                'source_channel_id': str(getattr(selected, 'chat_id', '')),
+                'source_message_id': int(getattr(selected, 'message_id', 0) or 0),
+            }
+            if getattr(selected, 'content_hash', None):
+                source_metadata['resource_content_hash'] = str(selected.content_hash)
+            if getattr(selected, 'updated_at', None):
+                source_metadata['resource_message_updated_at'] = str(selected.updated_at)
             source = TelegramSourceMessage(
                 source_type=SOURCE_WATCHLIST_SCOUT,
                 channel_id=str(getattr(selected, 'chat_id', '')),
@@ -199,10 +213,7 @@ class ScoutService:
                 message_id=int(getattr(selected, 'message_id', 0) or 0),
                 text=getattr(selected, 'text', ''),
                 urls=getattr(selected, 'urls', []),
-                metadata={'tmdb_id': tmdb_id, 'title': title, 'year': year, 'season': season,
-                          'episode_keys': episode_keys, 'share_url': share_url,
-                          'source_channel_id': str(getattr(selected, 'chat_id', '')),
-                          'source_message_id': int(getattr(selected, 'message_id', 0) or 0)},
+                metadata=source_metadata,
             )
             try:
                 ingest = await ChannelIngestService.process_source_message(db, source)

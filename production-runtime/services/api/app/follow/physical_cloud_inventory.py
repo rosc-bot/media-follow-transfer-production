@@ -13,6 +13,8 @@ import asyncio
 import hashlib
 import inspect
 import json
+import re
+from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -20,6 +22,7 @@ from typing import Any
 
 import httpx
 
+from app.follow.episode_keys import season_identity
 from app.transfer.episode_matcher import extract_video_episode_keys
 from app.transfer.errors import TransferErrorCategory, classify_error
 from app.transfer.guangya_auth import is_video_filename
@@ -42,8 +45,9 @@ class PhysicalCloudScanResult:
     items_read: int = 0
     unparsed_video_count: int = 0
     error: str | None = None
+    layout_conflicts: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     from_cache: bool = False
-    _observed_files: tuple[dict[str, str], ...] = field(default_factory=tuple, repr=False)
+    _observed_files: tuple[dict[str, Any], ...] = field(default_factory=tuple, repr=False)
 
     @property
     def verified(self) -> bool:
@@ -65,6 +69,7 @@ class PhysicalCloudScanResult:
             "pages_read": self.pages_read,
             "items_read": self.items_read,
             "unparsed_video_count": self.unparsed_video_count,
+            "layout_conflicts": [dict(item) for item in self.layout_conflicts],
             "error": self.error,
             "from_cache": self.from_cache,
             "verified_files": [dict(item) for item in self._observed_files] if self.verified else [],
@@ -148,7 +153,7 @@ class PhysicalCloudInventoryScanner:
         return raw
 
     @staticmethod
-    def _watermark(tmdb_id: int, root_id: str, files: list[dict[str, str]], timestamp: str) -> str:
+    def _watermark(tmdb_id: int, root_id: str, files: list[dict[str, Any]], timestamp: str) -> str:
         payload = {
             "tmdb_id": int(tmdb_id),
             "root_id": root_id,
@@ -187,8 +192,11 @@ class PhysicalCloudInventoryScanner:
 
         queue: list[tuple[str, int, str]] = [(root_id, 0, "")]
         visited: set[str] = set()
-        files: list[dict[str, str]] = []
+        files: list[dict[str, Any]] = []
         file_sizes_by_name: dict[str, int] = {}
+        season_folders: dict[int, list[dict[str, str]]] = defaultdict(list)
+        unknown_season_folders: list[dict[str, str]] = []
+        root_level_video_files: list[dict[str, str]] = []
         pages_read = 0
         items_read = 0
         unparsed = 0
@@ -225,10 +233,21 @@ class PhysicalCloudInventoryScanner:
                         item_id = self._item_id(item)
                         child_path = f"{relative}/{name}".strip("/")
                         if self._is_directory(item):
+                            if depth == 0:
+                                season_number = season_identity(name)
+                                folder_evidence = {"folder_id": item_id, "name": name, "path": child_path}
+                                if season_number is not None:
+                                    season_folders[int(season_number)].append(folder_evidence)
+                                elif re.search(r"(?i)\bS\s*\d+|\bSeason\s*\d+|第.{1,4}季|\d+季", name):
+                                    unknown_season_folders.append(folder_evidence)
+                            if not item_id:
+                                status = "API_ERROR"
+                                error = "DIRECTORY_ID_MISSING"
+                                break
                             if depth >= self.max_depth:
                                 status = "LIMIT_UNVERIFIED"
                                 error = "MAX_DEPTH_REACHED"
-                            elif item_id:
+                            else:
                                 queue.append((item_id, depth + 1, child_path))
                             continue
                         if not is_video_filename(name):
@@ -252,13 +271,17 @@ class PhysicalCloudInventoryScanner:
                             )
                         except (TypeError, ValueError):
                             file_sizes_by_name[name] = 0
-                        files.append({
+                        record = {
                             "season": f"S{season:02d}",
                             "episode_key": key,
                             "name": name,
                             "file_id": item_id,
                             "path": child_path,
-                        })
+                            "size_bytes": file_sizes_by_name.get(name, 0),
+                        }
+                        files.append(record)
+                        if depth == 0:
+                            root_level_video_files.append(record)
                     if status != "VERIFIED":
                         break
                     if has_more is True:
@@ -285,6 +308,37 @@ class PhysicalCloudInventoryScanner:
             category = classify_error(exc)
             error = f"{category}:{type(exc).__name__}" if category != TransferErrorCategory.UNKNOWN else type(exc).__name__
 
+        layout_conflicts: list[dict[str, Any]] = []
+        for season_number, folders in season_folders.items():
+            if len(folders) > 1:
+                layout_conflicts.append({
+                    "code": "DUPLICATE_SEASON_ROOT",
+                    "season_identity": int(season_number),
+                    "folders": [dict(folder) for folder in folders],
+                })
+        for folder in unknown_season_folders:
+            layout_conflicts.append({"code": "UNKNOWN_SEASON_FOLDER", **folder})
+        episode_occurrences: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        for file in files:
+            episode_occurrences[(file["season"], file["episode_key"])].append(file)
+        for (season_name, episode_key), copies in episode_occurrences.items():
+            if len(copies) > 1:
+                layout_conflicts.append({
+                    "code": "DUPLICATE_EPISODE_CONFLICT",
+                    "season": season_name,
+                    "episode_key": episode_key,
+                    "files": [dict(item) for item in copies],
+                })
+        if root_level_video_files and season_folders.get(1):
+            layout_conflicts.append({
+                "code": "MIXED_SINGLE_SEASON_LAYOUT",
+                "season_identity": 1,
+                "root_level_episode_files": [dict(item) for item in root_level_video_files],
+                "season_folders": [dict(item) for item in season_folders[1]],
+            })
+        if layout_conflicts and status == "VERIFIED":
+            status = "LAYOUT_CONFLICT_UNVERIFIED"
+            error = layout_conflicts[0]["code"]
         if unparsed and status == "VERIFIED":
             status = "UNPARSED_UNVERIFIED"
             error = "VIDEO_EPISODE_KEY_UNPARSED"
@@ -307,6 +361,7 @@ class PhysicalCloudInventoryScanner:
             items_read=items_read,
             unparsed_video_count=unparsed,
             error=error,
+            layout_conflicts=tuple(layout_conflicts),
             _observed_files=tuple(files),
         )
         self._cache[cache_key] = (now_epoch, result)

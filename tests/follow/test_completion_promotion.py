@@ -12,15 +12,17 @@ from app.models.watchlist import SeriesWatchlist
 
 @pytest.mark.asyncio
 async def test_completed_ongoing_series_is_enqueued_for_one_safe_promotion(tmp_path, monkeypatch):
-    async def fake_metadata(resource):
+    async def fake_metadata(resource, *, force_refresh=False):
+        assert force_refresh is True
         return {
             "id": resource.tmdb_id,
             "media_type": "tv",
+            "status": "Ended",
             "origin_country": ["CN"],
             "original_language": "zh",
             "genres": [{"id": 18, "name": "Drama"}],
             "metadata_complete": True,
-            "seasons": [{"season_number": 1}, {"season_number": 2}],
+            "seasons": [{"season_number": 1, "episode_count": 2}, {"season_number": 2, "episode_count": 3}],
         }
 
     monkeypatch.setattr(CompletionPromotionService, "_tmdb_metadata", staticmethod(fake_metadata))

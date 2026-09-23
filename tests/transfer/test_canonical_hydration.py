@@ -43,6 +43,8 @@ async def test_hydration_builds_canonical_category_and_inventory_prefix_from_tmd
         payload = await worker._hydrate_payload(db, row)
     assert payload["media_category"] == "国产剧"
     assert payload["media_root"] == "电视剧"
+    assert payload["ongoing_root_id"] == "ongoing"
+    assert payload["completed_root_id"] == "completed"
     assert payload["inventory_prefix"].endswith("电视剧/国产剧/修复错误！ (2026) {tmdbid-324487}/S01")
     assert payload["archive_directory"].startswith("未完结追新 / 电视剧 / 国产剧")
     await engine.dispose()

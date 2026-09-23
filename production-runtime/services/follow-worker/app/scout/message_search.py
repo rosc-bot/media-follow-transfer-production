@@ -13,6 +13,8 @@ class ResourceMessage:
     urls: list[str]
     chat_title: str | None = None
     source_link: str | None = None
+    content_hash: str | None = None
+    updated_at: str | None = None
 
     @property
     def url(self) -> str | None:
@@ -83,16 +85,40 @@ class MessageSearch:
         title_patterns = [self._safe_like_patterns(value) for value in titles]
         candidates: list[ResourceMessage] = []
         seen: set[tuple[str, int]] = set()
-        with sqlite3.connect(self.path) as db:
-            has_source_link = 'source_link' in {row[1] for row in db.execute('PRAGMA table_info(messages)').fetchall()}
-            select_cols = 'chat_id, chat_title, message_id, text, urls' + (', source_link' if has_source_link else '')
+        uri = self.path.resolve().as_uri() + '?mode=ro'
+        with sqlite3.connect(uri, uri=True) as db:
+            columns = {row[1] for row in db.execute('PRAGMA table_info(messages)').fetchall()}
+            selected_columns = ['chat_id', 'chat_title', 'message_id', 'text']
+            has_caption = 'caption' in columns
+            if has_caption:
+                selected_columns.append('caption')
+            selected_columns.append('urls')
+            selected_columns.extend(column for column in ('source_link', 'content_hash', 'updated_at') if column in columns)
+            if has_caption:
+                title_predicate = ' OR '.join(
+                    "(instr(lower(COALESCE(text, '')), ?) > 0 OR instr(lower(COALESCE(caption, '')), ?) > 0)"
+                    for _ in title_patterns
+                )
+                query_patterns = [pattern for value in title_patterns for pattern in (value, value)]
+            else:
+                title_predicate = ' OR '.join("instr(lower(COALESCE(text, '')), ?) > 0" for _ in title_patterns)
+                query_patterns = title_patterns
+            order_by = 'COALESCE(updated_at, date)' if 'updated_at' in columns else 'date'
             rows = db.execute(
-                f'SELECT {select_cols} FROM messages ORDER BY date DESC LIMIT 200'
+                f'SELECT {", ".join(selected_columns)} FROM messages WHERE ({title_predicate}) '
+                f'ORDER BY {order_by} DESC, message_id DESC LIMIT 200',
+                query_patterns,
             ).fetchall()
         for row in rows:
-            chat_id, chat_title, message_id, text, raw_urls = row[:5]
-            source_link = row[5] if len(row) > 5 else None
-            row_text = text or ''
+            values = dict(zip(selected_columns, row, strict=True))
+            chat_id = values['chat_id']
+            chat_title = values['chat_title']
+            message_id = values['message_id']
+            row_text = '\n'.join(
+                part for part in (str(values.get('text') or ''), str(values.get('caption') or '')) if part
+            ).strip()
+            raw_urls = values['urls']
+            source_link = values.get('source_link')
             lowered = row_text.lower()
             title_ok = any(pat in lowered for pat in title_patterns)
             if not title_ok:
@@ -112,6 +138,8 @@ class MessageSearch:
                 urls=urls,
                 chat_title=chat_title,
                 source_link=source_link,
+                content_hash=values.get('content_hash'),
+                updated_at=values.get('updated_at'),
             ))
         return candidates
 
@@ -131,7 +159,8 @@ class MessageSearch:
         counts: dict[str, dict] = {}
         total = 0
         total_with = 0
-        with sqlite3.connect(self.path) as db:
+        uri = self.path.resolve().as_uri() + '?mode=ro'
+        with sqlite3.connect(uri, uri=True) as db:
             rows = db.execute(
                 'SELECT chat_id, chat_title, urls FROM messages'
             ).fetchall()

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import copy
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -17,7 +18,7 @@ from app.follow.promotion import PromotionDecision, evaluate_promotion
 from app.follow.tmdb_provider import TMDBSeasonProvider
 from app.models.cloud import CloudConfig, CloudDiskInventory
 from app.models.resource import Resource
-from app.models.transfer import TransferQueueTask
+from app.models.transfer import TransferJob, TransferQueueTask
 from app.models.watchlist import SeriesWatchlist
 from app.transfer.destination_routing import DestinationRouter
 from app.transfer.normalization import build_idempotency_key
@@ -37,9 +38,9 @@ class CompletionPromotionService:
         ).order_by(Resource.id.desc()))
 
     @staticmethod
-    async def _tmdb_metadata(resource: Resource) -> dict[str, Any] | None:
+    async def _tmdb_metadata(resource: Resource, *, force_refresh: bool = False) -> dict[str, Any] | None:
         cached = getattr(resource, 'tmdb_metadata', None)
-        if isinstance(cached, dict) and cached.get('id'):
+        if not force_refresh and isinstance(cached, dict) and cached.get('id'):
             return dict(cached)
         if not resource.tmdb_id:
             return None
@@ -57,8 +58,17 @@ class CompletionPromotionService:
         rows = list((await db.scalars(select(TransferQueueTask).where(
             TransferQueueTask.status.in_(_ACTIVE_TRANSFER_STATUSES),
         ))).all())
+        transfer_job_count = int(await db.scalar(
+            select(func.count(TransferJob.id))
+            .join(Resource, Resource.id == TransferJob.resource_id)
+            .where(
+                Resource.tmdb_id == tmdb_id,
+                Resource.season == season,
+                TransferJob.status.in_(['QUEUED', 'RUNNING', 'RETRY_WAIT']),
+            )
+        ) or 0)
         if not rows:
-            return 0
+            return transfer_job_count
         resource_ids = {row.resource_id for row in rows if row.resource_id is not None}
         resources = {
             row.id: row
@@ -77,7 +87,7 @@ class CompletionPromotionService:
                     count += 1
             except (TypeError, ValueError):
                 continue
-        return count
+        return count + transfer_job_count
 
     @staticmethod
     async def build_dry_run(
@@ -91,6 +101,7 @@ class CompletionPromotionService:
         cloud_scan_timestamp: str | None = None,
         cloud_scan_watermark: str | None = None,
         require_cloud_scan_watermark: bool = False,
+        authoritative_metadata: Mapping[str, Any] | None = None,
     ) -> PromotionDecision:
         """Build a machine-readable promotion decision from DB and physical evidence.
 
@@ -108,12 +119,28 @@ class CompletionPromotionService:
         inventory_rows = list((await db.scalars(select(CloudDiskInventory).where(
             CloudDiskInventory.tmdb_id == watchlist.tmdb_id,
         ))).all())
+        resource = await CompletionPromotionService._latest_resource(db, watchlist.tmdb_id, watchlist.season)
+        metadata = dict(authoritative_metadata) if isinstance(authoritative_metadata, Mapping) else None
+        if metadata is None and resource is not None:
+            metadata = await CompletionPromotionService._tmdb_metadata(resource, force_refresh=True)
+        authoritative_status = str((metadata or {}).get('status') or '').strip() or None
+        tmdb_episode_counts: dict[int, int] = {}
+        for item in (metadata or {}).get('seasons') or []:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                season_number = int(item.get('season_number') or 0)
+                episode_count = int(item.get('episode_count') or 0)
+            except (TypeError, ValueError):
+                continue
+            if season_number > 0 and episode_count > 0:
+                tmdb_episode_counts[season_number] = episode_count
         seasons: list[dict[str, Any]] = []
         expected_files: dict[str, list[str]] = {}
         active_total = 0
         for row in all_rows:
             season = int(row.season or 1)
-            total = int(row.total_episodes or row.last_aired_episode or 0)
+            total = int(tmdb_episode_counts.get(season) or 0)
             collected = {
                 key
                 for value in (row.collected_episodes or [])
@@ -146,7 +173,7 @@ class CompletionPromotionService:
             active_total += active
             seasons.append({
                 "season": season,
-                "series_status": row.tmdb_series_status or watchlist.tmdb_series_status,
+                "series_status": authoritative_status if total > 0 else "UNKNOWN",
                 "total_expected": total,
                 "collected_count": len(collected),
                 "inventory_count": len(inventory),
@@ -158,13 +185,12 @@ class CompletionPromotionService:
                 "physical_evidence_available": physical is not None,
                 "active_transfer_count": active,
             })
-        resource = await CompletionPromotionService._latest_resource(db, watchlist.tmdb_id, watchlist.season)
         provider = str(resource.cloud_name if resource else 'guangya').lower()
         cloud_config = await db.scalar(select(CloudConfig).where(CloudConfig.name == provider))
         decision = evaluate_promotion(
             tmdb_id=watchlist.tmdb_id,
             title=watchlist.title,
-            series_status=watchlist.tmdb_series_status,
+            series_status=authoritative_status,
             seasons=seasons,
             ongoing_root=getattr(cloud_config, 'ongoing_target_folder_id', None),
             completed_root=getattr(cloud_config, 'target_folder_id', None),
@@ -305,6 +331,16 @@ class CompletionPromotionService:
             scan_timestamp = scan.get('scan_timestamp')
             scan_watermark = scan.get('scan_watermark')
             require_scan = bool(scan)
+            resource = await CompletionPromotionService._latest_resource(db, watchlist.tmdb_id, watchlist.season)
+            if resource is None:
+                continue
+            provider = str(resource.cloud_name or '').lower()
+            cloud_config = await db.scalar(select(CloudConfig).where(CloudConfig.name == provider))
+            if cloud_config is None or not cloud_config.enabled:
+                continue
+            metadata = await CompletionPromotionService._tmdb_metadata(resource, force_refresh=True)
+            if metadata is None:
+                continue
             decision = await CompletionPromotionService.build_dry_run(
                 db,
                 watchlist=watchlist,
@@ -315,23 +351,22 @@ class CompletionPromotionService:
                 cloud_scan_timestamp=scan_timestamp,
                 cloud_scan_watermark=scan_watermark,
                 require_cloud_scan_watermark=require_scan,
+                authoritative_metadata=metadata,
             )
             if decision.decision != 'PROMOTION_READY':
                 continue
-            resource = await CompletionPromotionService._latest_resource(db, watchlist.tmdb_id, watchlist.season)
-            if resource is None:
-                continue
-            provider = str(resource.cloud_name or '').lower()
-            cloud_config = await db.scalar(select(CloudConfig).where(CloudConfig.name == provider))
-            if cloud_config is None or not cloud_config.enabled:
-                continue
-            metadata = await CompletionPromotionService._tmdb_metadata(resource)
-            if metadata is None:
-                continue
+            route_watchlist = copy(watchlist)
+            route_watchlist.tmdb_series_status = metadata.get('status')
+            tmdb_counts = {
+                int(item.get('season_number') or 0): int(item.get('episode_count') or 0)
+                for item in (metadata.get('seasons') or [])
+                if isinstance(item, Mapping) and int(item.get('season_number') or 0) > 0
+            }
+            route_watchlist.total_episodes = tmdb_counts.get(int(watchlist.season or 1), 0)
             route = DestinationRouter.resolve(
                 resource=resource,
                 cloud_config=cloud_config,
-                watchlist=watchlist,
+                watchlist=route_watchlist,
                 incoming_episode_keys=[],
                 metadata=metadata,
                 operation='promote',
