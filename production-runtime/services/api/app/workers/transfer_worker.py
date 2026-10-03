@@ -53,11 +53,30 @@ async def _transfer_worker_heartbeat_loop(stop_event: asyncio.Event) -> None:
 
 async def recover_stale_tasks() -> int:
     async with AsyncSessionLocal() as db, db.begin():
-        return await TransferQueueService.recover_stale(db)
+        return await TransferQueueService.recover_stale(db, stale_after_seconds=0)
 
 
 async def run_once() -> bool:
     return await TransferQueueWorker(AsyncSessionLocal).process_once()
+
+
+async def _run_worker_slot(slot_id: int, poll_interval_seconds: float = 3.0) -> None:
+    import socket
+    if slot_id > 1:
+        await asyncio.sleep((slot_id - 1) * 1.2)
+    worker_id = f"{socket.gethostname()}:{os.getpid()}:worker-{slot_id}"
+    worker = TransferQueueWorker(AsyncSessionLocal, worker_id=worker_id)
+    logger.info("Transfer worker slot %d (%s) running...", slot_id, worker_id)
+    while True:
+        try:
+            processed = await worker.process_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Unexpected error in transfer worker slot %d, retrying in 5s...", slot_id)
+            await asyncio.sleep(5.0)
+            continue
+        await asyncio.sleep(0.5 if processed else poll_interval_seconds)
 
 
 async def run_transfer_worker(
@@ -68,31 +87,21 @@ async def run_transfer_worker(
 ) -> None:
     """Continuously consume the durable queue; default startup also recovers stale locks."""
     configure_logging()
-    logger.info("Transfer worker starting up...")
-    heartbeat_task = None
-    heartbeat_stop = None
-    if worker is None:
-        heartbeat_stop = asyncio.Event()
-        heartbeat_task = asyncio.create_task(_transfer_worker_heartbeat_loop(heartbeat_stop))
-        recovered = await recover_stale_tasks()
-        logger.info("Recovered %d stale transfer tasks", recovered)
-        worker = TransferQueueWorker(AsyncSessionLocal)
+    logger.info("Transfer worker starting up (3-Worker Concurrency Enabled)...")
+    heartbeat_stop = asyncio.Event()
+    heartbeat_task = asyncio.create_task(_transfer_worker_heartbeat_loop(heartbeat_stop))
+    recovered = await recover_stale_tasks()
+    logger.info("Recovered %d stale transfer tasks", recovered)
     try:
-        while True:
-            try:
-                processed = await worker.process_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Unexpected error in transfer worker process_once, retrying in 5s...")
-                await sleep(5.0)
-                continue
-            await sleep(0 if processed else poll_interval_seconds)
+        await asyncio.gather(
+            _run_worker_slot(1, poll_interval_seconds=3.0),
+            _run_worker_slot(2, poll_interval_seconds=3.0),
+            _run_worker_slot(3, poll_interval_seconds=3.0),
+        )
     finally:
-        if heartbeat_task is not None and heartbeat_stop is not None:
-            heartbeat_stop.set()
-            heartbeat_task.cancel()
-            await asyncio.gather(heartbeat_task, return_exceptions=True)
+        heartbeat_stop.set()
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
 
 
 if __name__ == '__main__':

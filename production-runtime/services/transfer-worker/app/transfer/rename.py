@@ -32,7 +32,9 @@ _QUALITY_PATTERN = re.compile(
     r"(?i)(?:2160p|1080p|720p|576p|480p|4k|uhd|web[- .]?dl|webrip|web[- .]?rip|bluray|bdrip|hdtv|remux|hevc|h\.?265|h\.?264|x264|x265|av1|ddp(?:[ .]?5\.1)?|aac|atmos|truehd|flac|dts(?:-hd)?|hdr10\+?|hdr|dolby[ ._-]?vision|dv|10bit|edr|\d{2,3}fps|fps)",
 )
 _EPISODE_PATTERN = re.compile(
-    r"(?i)(?<![A-Za-z0-9])S(?P<season>\d{1,2})[ ._\-–—]*E(?P<start>\d{1,4})(?:[ ._\-–—]*(?:-|~|到|至)[ ._\-–—]*(?:E|EP)?(?P<end>\d{1,4}))?",
+    r"(?i)(?<![A-Za-z0-9])S(?P<season>\d{1,2})[ ._\-–—]*E(?P<start>\d{1,4})"
+    r"(?:(?:[ ._\-–—]*(?:-|~|到|至)[ ._\-–—]*(?:E|EP)(?P<end1>\d{1,4}))"
+    r"|(?:(?:-|~|到|至)(?P<end2>\d{1,4})(?![A-Za-z0-9])))?",
 )
 _UUID_PATTERN = re.compile(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 _HEX_HASH_PATTERN = re.compile(r"(?i)^[0-9a-f]{16,}$")
@@ -177,6 +179,8 @@ def _release_spec(filename: str, *, media_type: str, episode_key: str | None = N
     suffix = re.sub(r"^[\s._\-–—()\[\]]+", "", suffix)
     suffix = re.sub(r"(?i)^(?:19|20)\d{2}[\s._\-–—]+", "", suffix)
     suffix = re.sub(r"(?i)\{\s*tmdb(?:id)?[-:_= ]*\d+\s*\}", "", suffix)
+    suffix = re.sub(r"[\s._\-–—()\[\]]+$", "", suffix)
+    suffix = re.sub(r"[\[\]()【】]+", ".", suffix)
     suffix = re.sub(r"\s+", ".", suffix)
     suffix = re.sub(r"\.{2,}", ".", suffix).strip(".")
     if not _QUALITY_PATTERN.search(suffix):
@@ -216,7 +220,7 @@ def _episode_identity(episode_key: str | None, source_filename: str, season: int
     if match:
         season_no = int(match.group("season"))
         start = int(match.group("start"))
-        end = match.group("end")
+        end = match.group("end1") or match.group("end2")
         return (
             f"S{season_no:02d}E{start:02d}-E{int(end):02d}"
             if end is not None
@@ -226,7 +230,7 @@ def _episode_identity(episode_key: str | None, source_filename: str, season: int
     if match:
         season_no = int(match.group("season"))
         start = int(match.group("start"))
-        end = match.group("end")
+        end = match.group("end1") or match.group("end2")
         return (
             f"S{season_no:02d}E{start:02d}-E{int(end):02d}"
             if end is not None
@@ -402,17 +406,14 @@ def build_rename_plan(
 
     for record in selected_records:
         old_name = record["name"]
-        meaningful = has_meaningful_media_name(
-            old_name,
-            media_type="movie" if is_movie else "tv",
-            title=title,
-            aliases=aliases,
-        )
-        keep = is_movie or complete
-        if keep and meaningful:
+        # 严格执行规范中文命名：只有当原文件名已经包含中文片名且包含 tmdbid 标识时才视为已规范化而保持
+        clean_t = str(title or "").strip()
+        already_standard = bool(clean_t and clean_t in old_name and (f"tmdbid-{int(tmdb_id)}" in old_name.lower() if tmdb_id else True))
+        if already_standard:
             decision_by_id[record["file_id"]] = "KEEP"
             skipped.append(record["file_id"])
             continue
+
         decision_by_id[record["file_id"]] = "RENAME_STANDARD_CHINESE"
         if is_movie:
             target = build_standard_chinese_movie_filename(

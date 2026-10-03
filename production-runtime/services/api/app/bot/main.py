@@ -218,20 +218,54 @@ async def _main_menu_content(db):
         types.InlineKeyboardButton(text="⚡ 实时转存队列", callback_data="menu:queue_status"),
         types.InlineKeyboardButton(text="🔄 全库打捞资源", callback_data="menu:sync_now"),
     )
-    follow_action = "▶️ 恢复追新" if follow_paused else "⏸️ 暂停追新"
-    transfer_action = "▶️ 恢复转存" if transfer_paused else "⏸️ 暂停转存"
     builder.row(
-        types.InlineKeyboardButton(
-            text=follow_action,
-            callback_data="menu:follow_resume" if follow_paused else "menu:follow_pause",
-        ),
-        types.InlineKeyboardButton(
-            text=transfer_action,
-            callback_data="menu:transfer_resume" if transfer_paused else "menu:transfer_pause",
-        ),
+        types.InlineKeyboardButton(text="⚙️ 系统状态与安全开关", callback_data="menu:settings"),
     )
-    builder.row(types.InlineKeyboardButton(text="⚙️ 追更管理", callback_data="menu:manage"))
     return text, builder.as_markup()
+
+
+
+def _clean_display_title(title: str) -> str:
+    if not title:
+        return "未知剧集"
+    t = re.sub(r"^.*?给你分享了[：:\s]*", "", title)
+    t = re.sub(r"[，,]\s*点击链接.*$", "", t)
+    t = re.sub(r"\{tmdb[\s\-:_]*\d+\}", "", t, flags=re.I)
+    t = t.strip(" ：:，,。")
+    return t or title.strip()
+
+
+def _format_display_episodes(eps: list[str], default_season: int = 1) -> str:
+    if not eps:
+        return f"S{default_season:02d} 全集"
+    if len(eps) == 1:
+        return eps[0]
+    nums = []
+    season_str = f"S{default_season:02d}"
+    for e in eps:
+        m = re.match(r"(?i)^(s\d+)?e(\d+)$", str(e))
+        if m:
+            if m.group(1):
+                season_str = m.group(1).upper()
+            nums.append(int(m.group(2)))
+    if nums and len(nums) == len(eps):
+        nums.sort()
+        if nums[-1] - nums[0] + 1 == len(nums):
+            return f"{season_str}E{nums[0]:02d}-E{nums[-1]:02d} ({len(nums)}集)"
+        return f"{season_str} ({len(nums)}集)"
+    return f"({len(eps)}集)"
+
+
+def _format_queue_task_line(t, res=None) -> str:
+    payload = t.payload if isinstance(t.payload, dict) else (json.loads(t.payload or "{}") if t.payload else {})
+    raw_title = payload.get("title") or (res.title if res else "未知剧集")
+    title = _clean_display_title(raw_title)
+    season = payload.get("season") or (res.season if res else 1) or 1
+    eps = payload.get("episode_keys") or ([res.episode_key] if res and res.episode_key else [])
+    eps_str = _format_display_episodes(eps, season)
+    provider = payload.get("provider") or (res.cloud_name if res else "") or "网盘"
+    provider_name = "光鸭" if "guangya" in provider.lower() else provider
+    return f"• #{t.id} <b>《{escape(title)}》</b> <code>{escape(eps_str)}</code> · {escape(provider_name)}"
 
 
 def build_dispatcher() -> Dispatcher:
@@ -1429,6 +1463,7 @@ def build_dispatcher() -> Dispatcher:
         )
         await message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
 
+
     # ── 转存队列看板 ──
     @router.message(Command("queue"))
     @router.callback_query(F.data == "menu:queue_status")
@@ -1436,47 +1471,135 @@ def build_dispatcher() -> Dispatcher:
         if isinstance(event, types.CallbackQuery):
             await event.answer()
         async with AsyncSessionLocal() as db:
-            rows = list((await db.scalars(
-                select(TransferQueueTask).where(TransferQueueTask.status.in_(["RUNNING", "QUEUED", "RETRY_WAIT"]))
-                .order_by(TransferQueueTask.id.asc()).limit(15)
+            running_tasks = list((await db.scalars(
+                select(TransferQueueTask).where(TransferQueueTask.status == "RUNNING").order_by(TransferQueueTask.id.desc())
             )).all())
-            failed_count = (await db.scalar(
-                select(func.count(TransferQueueTask.id)).where(TransferQueueTask.status == "FAILED")
+            queued_count = (await db.scalar(
+                select(func.count(TransferQueueTask.id)).where(TransferQueueTask.status == "QUEUED")
+            )) or 0
+            retry_count = (await db.scalar(
+                select(func.count(TransferQueueTask.id)).where(TransferQueueTask.status == "RETRY_WAIT")
             )) or 0
             completed_count = (await db.scalar(
                 select(func.count(TransferQueueTask.id)).where(TransferQueueTask.status.in_(SUCCESS_TERMINAL_STATUSES))
             )) or 0
-        running = [r for r in rows if r.status == "RUNNING"]
-        queued = [r for r in rows if r.status == "QUEUED"]
-        retry = [r for r in rows if r.status == "RETRY_WAIT"]
-        lines = ["⚡ <b>转存队列看板</b>\n",
-                 f"🚀 执行中：<b>{len(running)}</b>  ⏳ 等待：<b>{len(queued)}</b>  🔄 重试：<b>{len(retry)}</b>  ✅ 已完成：<b>{completed_count}</b>  ❌ 失败：<b>{failed_count}</b>\n"]
-        if running:
-            lines.append("🚀 <b>执行中：</b>")
-            for t in running:
-                lines.append(f"• 任务 #{t.id} 资源{t.resource_id}")
+            failed_count = (await db.scalar(
+                select(func.count(TransferQueueTask.id)).where(TransferQueueTask.status == "FAILED")
+            )) or 0
+
+            queued_tasks = list((await db.scalars(
+                select(TransferQueueTask).where(TransferQueueTask.status == "QUEUED")
+                .order_by(TransferQueueTask.priority.asc(), TransferQueueTask.id.desc()).limit(6)
+            )).all())
+
+            recent_completed = list((await db.scalars(
+                select(TransferQueueTask).where(TransferQueueTask.status.in_(SUCCESS_TERMINAL_STATUSES))
+                .order_by(TransferQueueTask.updated_at.desc()).limit(3)
+            )).all())
+
+            retry_tasks = list((await db.scalars(
+                select(TransferQueueTask).where(TransferQueueTask.status == "RETRY_WAIT")
+                .order_by(TransferQueueTask.id.desc()).limit(3)
+            )).all())
+
+            all_rids = {t.resource_id for t in (running_tasks + queued_tasks + recent_completed + retry_tasks) if t.resource_id}
+            resources_map = {}
+            if all_rids:
+                r_rows = (await db.scalars(select(Resource).where(Resource.id.in_(all_rids)))).all()
+                resources_map = {r.id: r for r in r_rows}
+
+        lines = [
+            "⚡ <b>转存队列看板</b>\n",
+            f"🚀 执行中：<b>{len(running_tasks)}</b>  ⏳ 等待：<b>{queued_count}</b>  🔄 重试：<b>{retry_count}</b>",
+            f"✅ 已完成：<b>{completed_count}</b>  ❌ 失败：<b>{failed_count}</b>\n"
+        ]
+
+        if running_tasks:
+            lines.append("🚀 <b>正在执行：</b>")
+            for t in running_tasks:
+                lines.append(_format_queue_task_line(t, resources_map.get(t.resource_id)))
         else:
-            lines.append("💤 Worker 空闲")
-        if queued:
-            lines.append(f"\n⏳ <b>排队 ({len(queued)})：</b>")
-            for t in queued[:5]:
-                lines.append(f"• #{t.id} 资源{t.resource_id}")
-        if retry:
-            lines.append(f"\n🔄 <b>重试等待 ({len(retry)})：</b>")
-            for t in retry[:5]:
-                lines.append(f"• #{t.id}")
+            lines.append("💤 Worker 空闲 (无执行中任务)")
+
+        if queued_tasks:
+            lines.append(f"\n⏳ <b>待转存 (优先排队前 {len(queued_tasks)} 条 / 共 {queued_count} 条)：</b>")
+            for t in queued_tasks:
+                lines.append(_format_queue_task_line(t, resources_map.get(t.resource_id)))
+
+        if retry_tasks:
+            lines.append(f"\n🔄 <b>重试等待 ({retry_count})：</b>")
+            for t in retry_tasks:
+                lines.append(_format_queue_task_line(t, resources_map.get(t.resource_id)))
+
+        if recent_completed:
+            lines.append("\n✅ <b>最近完成：</b>")
+            for t in recent_completed:
+                lines.append(_format_queue_task_line(t, resources_map.get(t.resource_id)))
+
         text = "\n".join(lines)
         builder = InlineKeyboardBuilder()
+        btn_row1 = []
+        if queued_count:
+            btn_row1.append(types.InlineKeyboardButton(text=f"⏳ 查看排队 ({queued_count})", callback_data="queue_waiting:0"))
         if failed_count:
-            builder.row(types.InlineKeyboardButton(text=f"📋 查看失败任务 ({failed_count})", callback_data="queue_failed:0"))
+            btn_row1.append(types.InlineKeyboardButton(text=f"📋 失败任务 ({failed_count})", callback_data="queue_failed:0"))
+        if btn_row1:
+            builder.row(*btn_row1)
         builder.row(
-            types.InlineKeyboardButton(text="🔄 刷新", callback_data="menu:queue_status"),
+            types.InlineKeyboardButton(text="🔄 刷新看板", callback_data="menu:queue_status"),
             types.InlineKeyboardButton(text="🏠 主菜单", callback_data="menu:overview"),
         )
         if isinstance(event, types.CallbackQuery):
             await _safe_edit(event.message, text, builder.as_markup())
         else:
             await event.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+
+    @router.callback_query(F.data.startswith("queue_waiting:"))
+    async def cb_queue_waiting(call: types.CallbackQuery) -> None:
+        principal = await _authorize_event(call)
+        if principal is None:
+            return
+        await call.answer()
+        page = 0
+        parts = (call.data or "").split(":")
+        if len(parts) >= 2 and parts[1].isdigit():
+            page = int(parts[1])
+        PAGE_SIZE = 8
+        async with AsyncSessionLocal() as db:
+            total = (await db.scalar(
+                select(func.count(TransferQueueTask.id)).where(TransferQueueTask.status == "QUEUED")
+            )) or 0
+            tasks = list((await db.scalars(
+                select(TransferQueueTask).where(TransferQueueTask.status == "QUEUED")
+                .order_by(TransferQueueTask.priority.asc(), TransferQueueTask.id.desc())
+                .offset(page * PAGE_SIZE).limit(PAGE_SIZE)
+            )).all())
+            rids = {t.resource_id for t in tasks if t.resource_id}
+            resources_map = {}
+            if rids:
+                r_rows = (await db.scalars(select(Resource).where(Resource.id.in_(rids)))).all()
+                resources_map = {r.id: r for r in r_rows}
+
+        total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        lines = [f"⏳ <b>排队任务列表</b> · 第 {page + 1}/{total_pages} 页 (共 {total} 条)\n"]
+        builder = InlineKeyboardBuilder()
+        for t in tasks:
+            lines.append(_format_queue_task_line(t, resources_map.get(t.resource_id)))
+
+        nav = []
+        if page > 0:
+            nav.append(types.InlineKeyboardButton(text="⬅️ 上一页", callback_data=f"queue_waiting:{page - 1}"))
+        nav.append(types.InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(types.InlineKeyboardButton(text="下一页 ➡️", callback_data=f"queue_waiting:{page + 1}"))
+        if nav:
+            builder.row(*nav)
+        builder.row(
+            types.InlineKeyboardButton(text="⚡ 返回看板", callback_data="menu:queue_status"),
+            types.InlineKeyboardButton(text="🏠 主菜单", callback_data="menu:overview"),
+        )
+        await _safe_edit(call.message, "\n".join(lines), builder.as_markup())
 
     @router.callback_query(F.data.startswith("queue_failed:"))
     async def cb_queue_failed(call: types.CallbackQuery) -> None:
@@ -1789,11 +1912,17 @@ def build_dispatcher() -> Dispatcher:
         await _record_callback_audit(call=call, principal=principal, action="IGNORE_EPISODE", target_task_id=tid, after={"status": "ignored"})
 
     # ── Settings ──
+    @router.callback_query(F.data == "menu:settings")
+    async def cb_settings(call: types.CallbackQuery) -> None:
+        await cmd_settings(call)
+
     @router.message(Command("settings"))
-    async def cmd_settings(message: types.Message) -> None:
-        principal = await _authorize_event(message)
+    async def cmd_settings(event: types.Message | types.CallbackQuery) -> None:
+        principal = await _authorize_event(event)
         if principal is None:
             return
+        if isinstance(event, types.CallbackQuery):
+            await event.answer()
         cfg = get_settings()
         async with AsyncSessionLocal() as db:
             follow_paused = await BotSettingsService.is_follow_paused(db)
@@ -1820,7 +1949,8 @@ def build_dispatcher() -> Dispatcher:
                 callback_data="menu:transfer_resume" if transfer_paused else "menu:transfer_pause",
             ),
         )
-        await message.answer(
+        builder.row(types.InlineKeyboardButton(text="🔙 返回主菜单", callback_data="menu:overview"))
+        text = (
             "⚙️ <b>系统状态</b>\n\n"
             f"🌐 环境：<code>{cfg.app_env}</code>\n"
             f"追新：<code>{follow_state}</code>\n"
@@ -1837,10 +1967,12 @@ def build_dispatcher() -> Dispatcher:
             f"RUNNING: <code>{queue_counts.get('RUNNING', 0)}</code>\n"
             f"RETRY_WAIT: <code>{queue_counts.get('RETRY_WAIT', 0)}</code>\n"
             f"PENDING: <code>{queue_counts.get('PENDING', 0)}</code>\n"
-            f"FAILED: <code>{queue_counts.get('FAILED', 0)}</code>",
-            reply_markup=builder.as_markup(),
-            parse_mode="HTML",
+            f"FAILED: <code>{queue_counts.get('FAILED', 0)}</code>"
         )
+        if isinstance(event, types.CallbackQuery) and event.message is not None:
+            await _safe_edit(event.message, text, builder.as_markup())
+        elif isinstance(event, types.Message):
+            await event.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
 
     # ── 全局错误处理 ──
     async def _err(event):
@@ -1871,8 +2003,6 @@ def bot_commands() -> list[BotCommand]:
         BotCommand(command="queue", description="⚡ 转存队列"),
         BotCommand(command="scan", description="🔍 扫描网盘物理文件"),
         BotCommand(command="sync", description="🔄 全库打捞资源"),
-        BotCommand(command="pause", description="⏸️ 暂停追更与转存"),
-        BotCommand(command="resume", description="▶️ 恢复追更与转存"),
         BotCommand(command="settings", description="⚙️ 系统状态与安全开关"),
         BotCommand(command="admins", description="👥 管理员列表/管理（需权限）"),
         BotCommand(command="help", description="💡 使用说明"),
@@ -1881,7 +2011,14 @@ def bot_commands() -> list[BotCommand]:
 
 async def register_command_menu(bot: Bot) -> None:
     cmds = bot_commands()
-    await bot.set_my_commands(cmds, scope=BotCommandScopeAllPrivateChats())
+    try:
+        await bot.set_my_commands(cmds)
+    except Exception:
+        pass
+    try:
+        await bot.set_my_commands(cmds, scope=BotCommandScopeAllPrivateChats())
+    except Exception:
+        pass
     admin = get_settings().admin_tg_id
     if admin:
         try:

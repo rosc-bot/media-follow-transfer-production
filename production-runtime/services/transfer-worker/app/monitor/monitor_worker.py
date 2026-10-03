@@ -22,7 +22,7 @@ async def run_once() -> int:
     async def ingest(payload: dict) -> None:
         source = TelegramSourceMessage.model_validate(payload)
         async with AsyncSessionLocal() as db, db.begin():
-            setting = await db.scalar(select(ChannelSetting).where(ChannelSetting.channel_id == source.channel_id))
+            setting = await db.scalar(select(ChannelSetting).where(ChannelSetting.channel_id.in_([str(source.channel_id), "-100" + str(source.channel_id).lstrip("-"), str(source.channel_id).replace("-100", "")])))
             await ChannelIngestService.process_source_message(db, source, channel_setting=setting)
 
     monitor = ResourceMonitor(outbox_path=get_settings().resource_messages_db, ingest_handler=ingest)
@@ -58,7 +58,7 @@ async def run_resource_monitor(
     async def ingest(payload: dict) -> None:
         source = TelegramSourceMessage.model_validate(payload)
         async with session_factory() as db, db.begin():
-            setting = await db.scalar(select(ChannelSetting).where(ChannelSetting.channel_id == source.channel_id))
+            setting = await db.scalar(select(ChannelSetting).where(ChannelSetting.channel_id.in_([str(source.channel_id), "-100" + str(source.channel_id).lstrip("-"), str(source.channel_id).replace("-100", "")])))
             await ChannelIngestService.process_source_message(db, source, channel_setting=setting)
 
     monitor = monitor_factory(outbox_path=settings.resource_messages_db, ingest_handler=ingest)

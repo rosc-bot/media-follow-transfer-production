@@ -80,3 +80,30 @@ def test_movie_uses_movie_category_and_no_tv_season():
 def test_category_change_is_review_not_automatic_move():
     assert CanonicalDestinationBuilder.category_change_status("国产剧", "欧美剧") == "CATEGORY_MISMATCH_REVIEW"
     assert CanonicalDestinationBuilder.category_change_status("国产剧", "国产剧") == "UNCHANGED"
+
+
+def test_anime_with_talking_keyword_is_not_misclassified_as_variety():
+    # Regression test for 暗黑灯火 (Black Torch, TMDB 285993):
+    # keyword "talking to animals" must not trigger substring "talk" -> "综艺"
+    item = metadata(
+        country=["JP"],
+        language="ja",
+        genres=[(16, "Animation"), (9648, "Mystery"), (10759, "Action & Adventure"), (10765, "Sci-Fi & Fantasy")],
+        genre_ids=[16, 9648, 10759, 10765],
+        keywords=["anime", "based on manga", "talking to animals", "ninja"],
+    )
+    result = CanonicalDestinationBuilder.resolve_category(item)
+    assert result.category == "日番"
+    assert result.variety is False
+
+    scifi = metadata(
+        country=["US"],
+        language="en",
+        genres=[(18, "Drama"), (10765, "Sci-Fi & Fantasy")],
+        genre_ids=[18, 10765],
+        keywords=["virtual reality", "alternate reality"],
+    )
+    scifi_res = CanonicalDestinationBuilder.resolve_category(scifi)
+    assert scifi_res.category == "欧美剧"
+    assert scifi_res.variety is False
+

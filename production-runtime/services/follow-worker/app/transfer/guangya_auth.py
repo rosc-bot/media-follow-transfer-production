@@ -44,9 +44,9 @@ logger = logging.getLogger(__name__)
 ACCOUNT_BASE = 'https://account.guangyapan.com'
 REFRESH_PATH = '/v1/auth/token'
 CLIENT_ID = 'aMe-8VSlkrbQXpUR'
-REFRESH_REQUEST_TIMEOUT = httpx.Timeout(12.0, connect=5.0, read=8.0, write=5.0, pool=2.0)
-REFRESH_DNS_TIMEOUT_SECONDS = 4.0
-REFRESH_MAX_ATTEMPTS = 2
+REFRESH_REQUEST_TIMEOUT = httpx.Timeout(30.0, connect=20.0, read=20.0, write=15.0, pool=10.0)
+REFRESH_DNS_TIMEOUT_SECONDS = 10.0
+REFRESH_MAX_ATTEMPTS = 4
 REFRESH_RETRY_BACKOFF_SECONDS = 0.25
 _SENSITIVE_ERROR_RE = re.compile(
     r'(?i)\b(access[_-]?token|refresh[_-]?token|authorization|cookie|auth_ref|password|secret|api[_-]?key)\b(\s*[:=]\s*)[^\s,;]+'

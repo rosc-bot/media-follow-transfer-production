@@ -38,6 +38,7 @@ class LegacyRootDiscoveryService:
     async def backfill(self, db: AsyncSession) -> int:
         rows = list((await db.scalars(select(SeriesWatchlist).where(
             SeriesWatchlist.remote_series_folder_id.is_(None),
+            SeriesWatchlist.status != 'CANCELLED',
         ))).all())
         by_provider: dict[str, list[SeriesWatchlist]] = {}
         for watchlist in rows:
@@ -60,11 +61,17 @@ class LegacyRootDiscoveryService:
             if not config or not config.enabled or not root_id or not auth_token:
                 continue
             try:
-                folders = await self.list_directories(
-                    provider=provider,
-                    auth_token=auth_token,
-                    parent_id=root_id,
-                )
+                l1 = await self.list_directories(provider=provider, auth_token=auth_token, parent_id=root_id)
+                folders = list(l1)
+                # Recursively descend into category folders (e.g. 电视剧, 动漫, 国产剧, 欧美剧, etc.)
+                for it1 in l1:
+                    if it1.get("resType") == 2 and not str(it1.get("name") or it1.get("fileName") or "").startswith("."):
+                        l2 = await self.list_directories(provider=provider, auth_token=auth_token, parent_id=str(it1.get("fileId") or it1.get("id")))
+                        folders.extend(l2)
+                        for it2 in l2:
+                            if it2.get("resType") == 2 and not str(it2.get("name") or it2.get("fileName") or "").startswith("."):
+                                l3 = await self.list_directories(provider=provider, auth_token=auth_token, parent_id=str(it2.get("fileId") or it2.get("id")))
+                                folders.extend(l3)
             except GuangyaTransferError as auth_exc:
                 # Credential/network problems must never break the Follow cycle:
                 # legacy discovery degrades to a structured, stack-trace-free skip.

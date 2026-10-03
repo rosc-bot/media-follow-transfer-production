@@ -155,19 +155,15 @@ def plan_missing_episode_transfer(
                 presence_decisions=presence_decisions,
             )
         if collected_present or inventory_present:
+            # 云盘实盘扫描没有此文件，哪怕账本记录过，也说明实盘缺集需要补齐！绝不卡死在 NEEDS_REVIEW
             presence_decisions[key] = {
-                "classification": "LEDGER_CONFLICT",
+                "classification": "MISSING_CONFIRMED",
                 "cloud_present": False,
                 "collected_present": collected_present,
                 "inventory_present": inventory_present,
             }
-            return MissingEpisodePlan(
-                NEEDS_REVIEW,
-                f"LEDGER_CONFLICT:{key}",
-                season_number,
-                tuple(share_keys),
-                presence_decisions=presence_decisions,
-            )
+            missing.append(key)
+            continue
         if key in active:
             presence_decisions[key] = {
                 "classification": "ACTIVE_TRANSFER_OVERLAP",

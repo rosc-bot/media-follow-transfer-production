@@ -39,7 +39,7 @@ MOVIE_CATEGORIES = (
 _TV_TYPES = frozenset({"tv", "series", "anime", "电视剧", "动漫", "show"})
 _MOVIE_TYPES = frozenset({"movie", "film", "电影"})
 _ENDED = frozenset({"ended", "canceled", "cancelled"})
-_CN_COUNTRIES = frozenset({"CN"})
+_CN_COUNTRIES = frozenset({"CN", "HK", "TW", "MO"})
 _JP_KR_COUNTRIES = frozenset({"JP", "KR"})
 _WESTERN_COUNTRIES = frozenset({
     "US", "GB", "CA", "AU", "NZ", "IE", "FR", "DE", "IT", "ES", "PT", "NL", "BE",
@@ -261,8 +261,25 @@ class CanonicalDestinationBuilder:
         searchable = (*genres, *keywords)
         animation = bool(genre_ids & _ANIMATION_IDS or _contains(searchable, "animation", "动画", "anime"))
         documentary = bool(genre_ids & _DOCUMENTARY_IDS or _contains(searchable, "documentary", "纪录"))
-        kids = bool(genre_ids & _KIDS_IDS or _contains(searchable, "kids", "children", "儿童", "family"))
-        variety = bool(genre_ids & _VARIETY_IDS or _contains(searchable, "reality", "variety", "talk", "综艺", "真人秀"))
+        kids = bool(genre_ids & _KIDS_IDS or _contains(searchable, "kids", "children", "儿童"))
+        variety = bool(
+            genre_ids & _VARIETY_IDS
+            or _contains(
+                searchable,
+                "variety show",
+                "reality show",
+                "reality-tv",
+                "reality tv",
+                "talk show",
+                "game show",
+                "stand-up comedy",
+                "综艺",
+                "真人秀",
+                "脱口秀",
+                "访谈",
+                "选秀",
+            )
+        )
         country_class = _country_class(countries)
         evidence: list[str] = []
         if countries:
@@ -274,14 +291,14 @@ class CanonicalDestinationBuilder:
 
         if kind == "movie":
             media_root = "电影"
-            if documentary:
+            if animation:
+                category = "动画电影"
+            elif documentary:
                 category = "纪录片"
             elif kids:
                 category = "儿童"
             elif variety:
                 category = "综艺"
-            elif animation:
-                category = "动画电影"
             elif country_class == "cn":
                 category = "华语电影"
             elif country_class == "jpkr":
@@ -292,13 +309,7 @@ class CanonicalDestinationBuilder:
                 category = "其他电影"
         else:
             media_root = "电视剧"
-            if documentary:
-                category = "纪录片"
-            elif kids:
-                category = "儿童"
-            elif variety:
-                category = "综艺"
-            elif animation and country_class == "jpkr":
+            if animation and country_class == "jpkr":
                 category = "日番"
             elif animation and country_class == "cn":
                 category = "国漫"
@@ -306,6 +317,12 @@ class CanonicalDestinationBuilder:
                 category = "欧美动漫"
             elif animation:
                 category = "其他剧"
+            elif documentary:
+                category = "纪录片"
+            elif kids:
+                category = "儿童"
+            elif variety:
+                category = "综艺"
             elif country_class == "cn":
                 category = "国产剧"
             elif country_class == "jpkr":
@@ -333,7 +350,13 @@ class CanonicalDestinationBuilder:
 
     @staticmethod
     def _item_name(*, title: str, year: int | None, tmdb_id: int) -> str:
+        import re as _re
         clean_title = _text(title)
+        clean_title = _re.sub(r"\s*[\(（][^\)）]*[\)）]", "", clean_title).strip()
+        clean_title = _re.sub(r"^[📺🎬⭐🍿🖥️📦💾👤📖🏷🎞🆔*\s]+", "", clean_title).strip()
+        clean_title = _re.sub(r"^\[\s*(?:电视剧|电影|剧集|动漫|纪录片|综艺)(?:[·•][^\]]*)?\s*\]\s*", "", clean_title).strip()
+        if not clean_title:
+            clean_title = _text(title)
         if not clean_title:
             raise DestinationMetadataIncomplete("title is required for destination routing")
         parts = [clean_title]

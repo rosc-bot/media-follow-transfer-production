@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,6 +53,7 @@ class ScheduleService:
             for key in ('total_episodes', 'last_aired_episode', 'tmdb_series_status'):
                 if data.get(key) is not None:
                     setattr(row, key, data[key])
+            row.last_sync_at = datetime.now(UTC)
             changed += 1
         await db.flush()
         return changed

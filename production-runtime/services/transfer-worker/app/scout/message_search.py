@@ -67,10 +67,28 @@ class MessageSearch:
 
     @staticmethod
     def _row_urls(raw: str) -> list[str]:
-        try:
-            return [str(u) for u in json.loads(raw or '[]') if str(u).startswith('http')]
-        except json.JSONDecodeError:
+        if not raw:
             return []
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return [raw.strip()] if raw.strip().startswith('http') else []
+        urls: list[str] = []
+        if isinstance(data, list):
+            urls = [str(u) for u in data if isinstance(u, str) and u.startswith('http')]
+        elif isinstance(data, dict):
+            all_u = data.get('all_urls')
+            if isinstance(all_u, list):
+                urls = [str(u) for u in all_u if isinstance(u, str) and u.startswith('http')]
+            if not urls:
+                for v in data.values():
+                    if isinstance(v, list):
+                        urls.extend(str(u) for u in v if isinstance(u, str) and u.startswith('http'))
+                    elif isinstance(v, str) and v.startswith('http'):
+                        urls.append(v)
+        from app.ingest.url_extractor import clean_url
+        cleaned = [clean_url(u) for u in urls if u]
+        return [u for u in dict.fromkeys(cleaned) if u.startswith('http')]
 
     # -- search ---------------------------------------------------------- #
 

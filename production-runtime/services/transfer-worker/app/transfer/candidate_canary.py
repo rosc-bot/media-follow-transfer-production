@@ -25,7 +25,7 @@ from app.transfer.canary_preflight import (
     _episode_numbers,
     validate_remote_canary,
 )
-from app.transfer.status import SUCCESS_TERMINAL_STATUSES, TransferStatus
+from app.transfer.status import SUCCESS_TERMINAL_STATUSES, is_execution_active_task
 from app.transfer.task_identity import task_matches_episode
 
 
@@ -182,7 +182,7 @@ async def _static_candidate_check(
     active = [
         item.id
         for item in same_episode
-        if item.status in {TransferStatus.QUEUED, TransferStatus.RETRY_WAIT, TransferStatus.RUNNING}
+        if is_execution_active_task(item)
     ]
     if active:
         _set_result(row, NEEDS_REVIEW, "DUPLICATE_ACTIVE", f"task_ids={active}")

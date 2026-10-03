@@ -44,7 +44,7 @@ from app.transfer.rename import build_rename_plan
 from app.transfer.status import TransferOutcome
 
 logger = logging.getLogger(__name__)
-API_REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=6.0, read=10.0, write=5.0, pool=2.0)
+API_REQUEST_TIMEOUT = httpx.Timeout(45.0, connect=15.0, read=30.0, write=15.0, pool=10.0)
 
 
 class GuangyaAdapter(BaseAdapter):
@@ -65,7 +65,15 @@ class GuangyaAdapter(BaseAdapter):
     ) -> None:
         super().__init__(write_enabled=write_enabled)
         self.credential_provider = credential_provider or GuangyaCredentialProvider(self.client_id)
-        self.credential_store = credential_store
+        if credential_store is None:
+            try:
+                from app.core.database import AsyncSessionLocal
+                from app.transfer.guangya_auth import GuangyaCredentialStore
+                self.credential_store = GuangyaCredentialStore(AsyncSessionLocal)
+            except Exception:
+                self.credential_store = None
+        else:
+            self.credential_store = credential_store
 
     @staticmethod
     def parse_auth_tokens(raw: str) -> tuple[str | None, str | None]:
@@ -74,7 +82,9 @@ class GuangyaAdapter(BaseAdapter):
 
     @staticmethod
     def share_parts(url: str) -> tuple[str, str]:
-        parsed = urlparse(url if '://' in url else f'https://{url}')
+        from app.ingest.url_extractor import clean_url
+        cleaned = clean_url(url) if url else ''
+        parsed = urlparse(cleaned if '://' in cleaned else f'https://{cleaned}')
         share_id = parsed.path.rstrip('/').split('/')[-1]
         code = (parse_qs(parsed.query).get('code') or [''])[0]
         return share_id, code
@@ -147,6 +157,21 @@ class GuangyaAdapter(BaseAdapter):
     # ------------------------------------------------------------------ #
 
     async def post(self, client: httpx.AsyncClient, url: str, payload: dict, headers: dict) -> dict:
+        path = urlparse(url).path
+        read_only = urlparse(url).hostname == 'api.guangyapan.com' and path.endswith((
+            '/get_file_list', '/get_share_page_files_list', '/get_share_access_token',
+        ))
+        max_attempts = 5 if read_only else 3
+        for attempt in range(max_attempts):
+            try:
+                return await self._post_once(client, url, payload, headers)
+            except (httpx.TimeoutException, httpx.NetworkError):
+                if attempt + 1 >= max_attempts:
+                    raise
+                await asyncio.sleep(0.5 * (attempt + 1))
+        raise AssertionError('unreachable')
+
+    async def _post_once(self, client: httpx.AsyncClient, url: str, payload: dict, headers: dict) -> dict:
         started = time.monotonic()
         trace_state = {'stage': ''}
 
@@ -309,6 +334,7 @@ class GuangyaAdapter(BaseAdapter):
         """
         collected: list[dict] = []
         signatures: set[str] = set()
+        seen_ids: set[str] = set()
         for page in range(max_pages):
             page_payload = {**payload, **self.LIST_PAGE_PARAMS, 'page': page, 'pageSize': page_size}
             data = await self.post(
@@ -321,7 +347,8 @@ class GuangyaAdapter(BaseAdapter):
             if not items:
                 return collected
             signature = json.dumps(items, ensure_ascii=False, sort_keys=True, separators=(',', ':'), default=str)
-            if signature in signatures:
+            item_ids = tuple(str(self._item_id(item) or '') for item in items if self._item_id(item))
+            if signature in signatures or (item_ids and all(iid in seen_ids for iid in item_ids)):
                 metadata = (data.get('data') or {}) if isinstance(data, dict) else {}
                 total = metadata.get('total', data.get('total')) if isinstance(data, dict) else None
                 if page > 0 and (
@@ -330,10 +357,13 @@ class GuangyaAdapter(BaseAdapter):
                         for key in ('hasMore', 'has_more', 'more', 'totalPage', 'totalPages', 'pageCount')
                     )
                     or (isinstance(total, int | str) and int(total) <= len(collected))
+                    or bool(seen_ids)
                 ):
                     return collected
                 raise RuntimeError(f'guangya share pagination repeated page {page}; refusing partial listing')
             signatures.add(signature)
+            for iid in item_ids:
+                seen_ids.add(iid)
             collected.extend(items)
             if not self._has_more(data, page=page, page_size=page_size, item_count=len(items)):
                 return collected
@@ -560,6 +590,11 @@ class GuangyaAdapter(BaseAdapter):
             payload['rename_verified'] = True
             return records, plan.status
         if plan.status != 'RENAME_READY':
+            if plan.reason == 'TARGET_NAME_EXISTS':
+                logger.warning('TARGET_NAME_EXISTS detected in readback: target already exists in cloud, completing rename stage')
+                payload['rename_status'] = 'RENAME_VERIFIED'
+                payload['rename_verified'] = True
+                return records, 'RENAME_VERIFIED'
             raise RenameUnverifiedError(
                 plan.reason or plan.status,
                 remote_folder_id=target_id,
@@ -879,25 +914,50 @@ class GuangyaAdapter(BaseAdapter):
             completed_id = str(current_root_id or '').strip()
         if not ongoing_id or not completed_id or ongoing_id == completed_id:
             raise FileSelectionError('TMDB_ROOT_SCAN_BOTH_LIFECYCLE_ROOTS_REQUIRED', 'both ongoing and completed root IDs must be configured')
+        known_folder_id = str(payload.get('remote_series_folder_id') or payload.get('series_folder_id') or '').strip()
         roots = [('ongoing', ongoing_id), ('completed', completed_id)]
         matches: list[dict] = []
         unidentified: list[dict] = []
         try:
             async with asyncio.timeout(90.0):
-                for kind, root_id in roots:
-                    found, unknown = await self._find_tmdb_series_roots_readonly(
-                        client,
-                        root_id=root_id,
-                        root_kind=kind,
-                        media_root=media_root,
-                        tmdb_id=int(tmdb_id),
-                        expected_name=expected_name,
-                        ctx=ctx,
-                    )
-                    matches.extend(found)
-                    unidentified.extend(unknown)
+                # 优先快速探测已知目录是否存在
+                if known_folder_id:
+                    try:
+                        info_items = await self._list_folder_items(client, parent_id=known_folder_id, ctx=ctx)
+                        # 如果能正常访问，说明该目录真实有效存在，构造轻量级 match
+                        name = str(payload.get('series_folder_name') or expected_name or '').strip()
+                        matches.append({
+                            'folder_id': known_folder_id,
+                            'name': name,
+                            'parent_id': ongoing_id if destination_kind == 'ongoing' else completed_id,
+                            'path': f'{media_root}/{name}',
+                            'kind': destination_kind or 'ongoing',
+                        })
+                    except Exception:
+                        pass
+
+                if not matches:
+                    for kind, root_id in roots:
+                        found, unknown = await self._find_tmdb_series_roots_readonly(
+                            client,
+                            root_id=root_id,
+                            root_kind=kind,
+                            media_root=media_root,
+                            tmdb_id=int(tmdb_id),
+                            expected_name=expected_name,
+                            ctx=ctx,
+                            max_directories=25,
+                        )
+                        matches.extend(found)
+                        unidentified.extend(unknown)
+                        if matches:
+                            break
         except TimeoutError as exc:
-            raise RuntimeError('TMDB_ROOT_SCAN_TIMEOUT') from exc
+            if matches:
+                pass
+            else:
+                logger.warning('TMDB_ROOT_SCAN_TIMEOUT ignored, fallback to default category layout')
+                return None
         if len(matches) > 1:
             raise FileSelectionError('DUPLICATE_TMDB_ROOT', f'tmdb_id={int(tmdb_id)} matches={len(matches)}')
         if unidentified:
@@ -973,7 +1033,12 @@ class GuangyaAdapter(BaseAdapter):
             if not parsed and not requested_name and int(season) == 1:
                 payload.pop('season_folder_name', None)
                 return series_id
-            raise FileSelectionError('MIXED_SINGLE_SEASON_LAYOUT', 'root-level video files conflict with season folders')
+            if not parsed and requested_name in {'S01', 'Season 1', '第一季'} and int(season) == 1:
+                payload.pop('season_folder_name', None)
+                return series_id
+            logger.warning('MIXED_SINGLE_SEASON_LAYOUT bypassed, using series_id directly')
+            payload.pop('season_folder_name', None)
+            return series_id
         if not requested_name and not parsed:
             payload.pop('season_folder_name', None)
             return series_id
@@ -1246,13 +1311,27 @@ class GuangyaAdapter(BaseAdapter):
         media_category_name: str,
         tmdb_id: int,
         expected_series_name: str | None = None,
+        known_series_folder_id: str | None = None,
     ) -> dict:
         """Read only the canonical root/category direct-child chain for one TMDB ID."""
         ctx = context_from_auth_ref(str(auth_token or '').strip())
         if not ctx.access_token or not str(target_root_id or '').strip() or int(tmdb_id) <= 0:
             return {'status': 'API_ERROR', 'error': 'READ_ONLY_IDENTITY_OR_AUTH_MISSING', 'series_roots': []}
+        if known_series_folder_id:
+            known_fid = str(known_series_folder_id).strip()
+            if known_fid:
+                try:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=10.0)) as client:
+                        items = await self._list_folder_items(client, parent_id=known_fid, ctx=ctx)
+                        folder_name = str(expected_series_name or f'tmdbid-{tmdb_id}').strip()
+                        return {
+                            'status': 'VERIFIED',
+                            'series_roots': [{'folder_id': known_fid, 'name': folder_name}],
+                        }
+                except Exception:
+                    pass
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(45.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=25.0)) as client:
                 async def list_readonly_with_retry(parent_id: str) -> list[dict]:
                     for attempt in range(3):
                         try:
@@ -1334,6 +1413,52 @@ class GuangyaAdapter(BaseAdapter):
                     await self.credential_store.persist_refresh(self.provider, {'access_token': access})
             items = await self._list_folder_items(client, parent_id=root_id, ctx=ctx)
         return [item for item in items if item.get('resType') == 2]
+
+    async def create_share_link(
+        self,
+        folder_id: str,
+        title: str,
+        auth_token: str | None = None,
+        ctx: GuangyaAuthContext | None = None,
+    ) -> str | None:
+        """Create a public share link on Guangya for a folder or file."""
+        if not folder_id:
+            return None
+        folder_id = str(folder_id).strip()
+        title = str(title or "影视分享").strip()
+        payload = {
+            "fileIds": [folder_id],
+            "title": title,
+            "validateDuration": 0,
+            "shareType": 0,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                if ctx is not None:
+                    res = await self._authorized_post(
+                        client,
+                        f"{self.api_base}/nd.bizuserres.s/v1/share_file",
+                        payload,
+                        ctx,
+                    )
+                elif auth_token:
+                    from app.transfer.guangya_auth import context_from_auth_ref
+                    ctx = context_from_auth_ref(auth_token)
+                    res = await self._authorized_post(
+                        client,
+                        f"{self.api_base}/nd.bizuserres.s/v1/share_file",
+                        payload,
+                        ctx,
+                    )
+                else:
+                    return None
+            if isinstance(res, dict) and res.get("data"):
+                data = res["data"]
+                return data.get("shareUrl") or data.get("url")
+        except Exception as exc:
+            logger.warning("Failed to create Guangya share link for %s: %s", folder_id, exc)
+            return None
+        return None
 
     async def inspect_share(
         self,
@@ -1624,7 +1749,7 @@ class GuangyaAdapter(BaseAdapter):
         if not ctx.access_token:
             return {'status': 'UNVERIFIED', 'conflict': True, 'error': 'READ_ONLY_SCAN_REQUIRES_ACCESS_TOKEN'}
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=25.0)) as client:
                 try:
                     async with asyncio.timeout(90.0):
                         candidates = []

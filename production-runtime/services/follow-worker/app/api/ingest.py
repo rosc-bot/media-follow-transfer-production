@@ -12,7 +12,13 @@ router = APIRouter(prefix='/ingest', tags=['ingest'])
 
 @router.post('/source-message')
 async def ingest_source(source: TelegramSourceMessage, db: AsyncSession = Depends(get_db)):  # noqa: B008
-    setting = await db.scalar(select(ChannelSetting).where(ChannelSetting.channel_id == source.channel_id))
+    raw_id = str(source.channel_id).strip()
+    cand_ids = [raw_id]
+    if raw_id.startswith("-100"):
+        cand_ids.append(raw_id[4:])
+    else:
+        cand_ids.append(f"-100{raw_id.lstrip('-')}")
+    setting = await db.scalar(select(ChannelSetting).where(ChannelSetting.channel_id.in_(cand_ids)))
     result = await ChannelIngestService.process_source_message(db, source, channel_setting=setting)
     await db.commit()
     return result

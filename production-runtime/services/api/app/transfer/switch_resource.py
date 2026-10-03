@@ -40,7 +40,7 @@ from app.transfer.candidate_service import (
     stable_share_key,
 )
 from app.transfer.queue_service import TransferQueueService
-from app.transfer.status import EXECUTION_ACTIVE_STATUSES
+from app.transfer.status import EXECUTION_ACTIVE_STATUSES, is_execution_active_task
 
 logger = logging.getLogger(__name__)
 
@@ -174,9 +174,9 @@ async def switch_resource(
     # Group episode-level candidate picks by the actual share identity before
     # creating Resources or queue rows. One share that covers several missing
     # episodes becomes one Resource and one MISSING_EPISODES task.
-    active_tasks = (await db.execute(
+    active_tasks = [task for task in (await db.execute(
         select(TransferQueueTask).where(TransferQueueTask.status.in_(EXECUTION_ACTIVE_STATUSES))
-    )).scalars().all()
+    )).scalars().all() if is_execution_active_task(task)]
     groups: dict[tuple[str, str], dict] = {}
     for raw_episode_key, pick in chosen_by_episode.items():
         episode_key = canonical_episode_key(int(season or 1), raw_episode_key)

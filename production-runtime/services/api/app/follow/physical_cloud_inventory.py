@@ -336,12 +336,11 @@ class PhysicalCloudInventoryScanner:
                 "root_level_episode_files": [dict(item) for item in root_level_video_files],
                 "season_folders": [dict(item) for item in season_folders[1]],
             })
-        if layout_conflicts and status == "VERIFIED":
+        # 轻量化优化：不再因非关键子目录混合布局或花絮无集数文件阻断核心入库与核销
+        critical_conflicts = [c for c in layout_conflicts if c.get("code") == "DUPLICATE_SEASON_ROOT"]
+        if critical_conflicts and status == "VERIFIED":
             status = "LAYOUT_CONFLICT_UNVERIFIED"
-            error = layout_conflicts[0]["code"]
-        if unparsed and status == "VERIFIED":
-            status = "UNPARSED_UNVERIFIED"
-            error = "VIDEO_EPISODE_KEY_UNPARSED"
+            error = critical_conflicts[0]["code"]
         by_season: dict[int, tuple[str, ...]] = {
             season: tuple(sorted({item["episode_key"] for item in files if item["season"] == f"S{season:02d}"}))
             for season in seasons

@@ -1,3 +1,5 @@
+from app.core.database import AsyncSessionLocal
+from app.transfer.guangya_auth import GuangyaCredentialStore
 from app.core.exceptions import TransferVerificationError
 from app.transfer.adapters import CloudAdapter, DryRunAdapter
 from app.transfer.adapters.alist import AlistAdapter
@@ -10,7 +12,7 @@ from app.transfer.status import TransferOutcome
 class TransferOrchestrator:
     def __init__(self, adapters: dict[str, CloudAdapter] | None = None) -> None:
         self.adapters = adapters or {
-            'guangya': GuangyaAdapter(), 'mobile': MobileAdapter(), 'alist': AlistAdapter(), 'dry-run': DryRunAdapter(),
+            'guangya': GuangyaAdapter(credential_store=GuangyaCredentialStore(AsyncSessionLocal)), 'mobile': MobileAdapter(), 'alist': AlistAdapter(), 'dry-run': DryRunAdapter(),
         }
 
     async def execute(self, payload: dict) -> TransferOutcome:

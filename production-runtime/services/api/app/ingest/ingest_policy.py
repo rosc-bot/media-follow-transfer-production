@@ -18,7 +18,7 @@ def decide_ingest(*, source_type: str, is_forward: bool, setting: object | None)
     role = getattr(setting, 'role', None) if setting else None
     enabled = getattr(setting, 'enabled', True)
     accept_forward = getattr(setting, 'accept_forward', False)
-    transfer_mode = getattr(setting, 'transfer_mode', 'OFF')
+    transfer_mode = getattr(setting, 'transfer_mode', 'AUTO')
     if enabled is False:
         return IngestDecision(False, source_type, False, 'channel disabled')
     if role == 'PUBLISH_ONLY':

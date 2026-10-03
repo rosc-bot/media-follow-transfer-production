@@ -57,7 +57,11 @@ def evaluate(candidate, *, title: str, episode_key: str) -> tuple[bool, str | No
     matched_url = next((u for u in urls if 'guangyapan' in u or 'gypan' in u), None) or (urls[0] if urls else None)
     if matched_url is None:
         return False, 'no_url'
-    return True, matched_url
+    from app.ingest.url_extractor import clean_url
+    cleaned_match = clean_url(matched_url)
+    if not cleaned_match.startswith('http'):
+        return False, 'no_url'
+    return True, cleaned_match
 
 
 class CandidateSelector:
@@ -66,7 +70,9 @@ class CandidateSelector:
         """Rank valid candidates; expose rejection reason per candidate."""
         valid: list[SelectedCandidate] = []
         for candidate in candidates:
-            _matched, matched_url = evaluate(candidate, title=title, episode_key=episode_key)
+            matched, matched_url = evaluate(candidate, title=title, episode_key=episode_key)
+            if not matched or not matched_url:
+                continue
             score = 100 if title.lower() in (getattr(candidate, 'text', None) or '').lower() else 50
             valid.append(SelectedCandidate(
                 candidate, episode_key, score, matched_url=matched_url,

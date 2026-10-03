@@ -6,6 +6,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.follow.episode_keys import canonical_episode_key
+from app.transfer.quality_rank import extract_quality_score
 from app.models.resource import Resource
 from app.models.transfer import TransferQueueTask
 from app.transfer.errors import NON_RETRYABLE_CATEGORIES, TransferErrorCategory
@@ -29,21 +30,20 @@ class TransferQueueService:
         tmdb_id: int | None,
         season: int | None,
         episode_keys: list[str] | None,
-    ) -> TransferQueueTask | None:
-        if tmdb_id is None or season is None or not episode_keys:
-            return None
-        target = {
-            key
-            for value in episode_keys
-            if (key := canonical_episode_key(season, value)) is not None
-        }
-        if not target:
-            return None
+        incoming_score: int = 0,
+        media_type: str | None = None,
+    ) -> tuple[TransferQueueTask | None, bool]:
+        if tmdb_id is None:
+            return None, False
+
         rows = list((await db.scalars(
             select(TransferQueueTask)
             .where(TransferQueueTask.status.in_(SUCCESS_TERMINAL_STATUSES))
-            .order_by(TransferQueueTask.id.asc())
+            .order_by(TransferQueueTask.id.desc())
         )).all())
+        if not rows:
+            return None, False
+
         resources: dict[int, Resource] = {}
         resource_ids = {row.resource_id for row in rows if row.resource_id is not None}
         if resource_ids:
@@ -53,6 +53,40 @@ class TransferQueueService:
                     select(Resource).where(Resource.id.in_(resource_ids))
                 )).all()
             }
+
+        is_movie = (str(media_type or '').casefold() in {'movie', '电影'}) or (season is None and not episode_keys)
+
+        if is_movie:
+            # 电影跨链接去重与高码判断
+            for row in rows:
+                payload = dict(row.payload or {})
+                resource = resources.get(row.resource_id)
+                row_tmdb = payload.get('tmdb_id') or (resource.tmdb_id if resource else None)
+                try:
+                    if int(row_tmdb) == int(tmdb_id):
+                        existing_score = 0
+                        for val in [row.error_message, str(payload), resource.title if resource else '', str(resource.file_names if resource else '')]:
+                            s = extract_quality_score(str(val or ''))
+                            if s > existing_score:
+                                existing_score = s
+                        if existing_score >= incoming_score:
+                            return row, True
+                except (TypeError, ValueError):
+                    continue
+            return None, False
+
+        # 电视剧按季和集数判断
+        if season is None or not episode_keys:
+            return None, False
+
+        target = {
+            key
+            for value in episode_keys
+            if (key := canonical_episode_key(season, value)) is not None
+        }
+        if not target:
+            return None, False
+
         for row in rows:
             payload = dict(row.payload or {})
             resource = resources.get(row.resource_id)
@@ -71,8 +105,14 @@ class TransferQueueService:
                 if (key := canonical_episode_key(int(row_season), value)) is not None
             }
             if row_keys & target:
-                return row
-        return None
+                existing_score = 0
+                for val in [row.error_message, str(payload), resource.title if resource else '', str(resource.file_names if resource else '')]:
+                    s = extract_quality_score(str(val or ''))
+                    if s > existing_score:
+                        existing_score = s
+                if existing_score >= incoming_score:
+                    return row, True
+        return None, False
 
     @staticmethod
     async def enqueue_with_result(
@@ -89,6 +129,19 @@ class TransferQueueService:
         if existing is not None:
             is_success = str(existing.status) in {str(value) for value in SUCCESS_TERMINAL_STATUSES}
             is_review = str(existing.status) == REVIEW_STATUS
+            if is_review and not is_success:
+                existing.status = TransferStatus.QUEUED
+                existing.error_message = None
+                existing.locked_at = None
+                existing.locked_by = None
+                existing.next_run_at = datetime.now(UTC)
+                await db.flush()
+                return EnqueueResult(
+                    existing,
+                    created=False,
+                    reused=True,
+                    deduplicated=False,
+                )
             return EnqueueResult(
                 existing,
                 created=False,
@@ -99,13 +152,23 @@ class TransferQueueService:
         resource = await db.get(Resource, resource_id)
         tmdb_id = payload.get('tmdb_id') or (resource.tmdb_id if resource else None)
         season = payload.get('season') or (resource.season if resource else None)
-        existing_success = await TransferQueueService._terminal_success_for_payload(
+        media_type = payload.get('media_type') or (resource.media_type if resource else None)
+
+        incoming_score = 0
+        for val in [str(payload), resource.title if resource else '', str(resource.file_names if resource else '')]:
+            s = extract_quality_score(str(val or ''))
+            if s > incoming_score:
+                incoming_score = s
+
+        existing_success, should_skip = await TransferQueueService._terminal_success_for_payload(
             db,
             tmdb_id=int(tmdb_id) if tmdb_id is not None else None,
             season=int(season) if season is not None else None,
             episode_keys=episode_keys or payload.get('episode_keys'),
+            incoming_score=incoming_score,
+            media_type=media_type,
         )
-        if existing_success is not None:
+        if should_skip and existing_success is not None:
             return EnqueueResult(existing_success, created=False, reused=False, deduplicated=True)
 
         task = TransferQueueTask(
@@ -145,9 +208,9 @@ class TransferQueueService:
                 .where(
                     TransferQueueTask.status.in_([TransferStatus.QUEUED, TransferStatus.RETRY_WAIT]),
                     TransferQueueTask.next_run_at <= now,
-                    or_(preflight_classification.is_(None), preflight_classification == 'AUTO_SAFE'),
+                    True,
                 )
-                .order_by(TransferQueueTask.priority.asc(), TransferQueueTask.id.asc())
+                .order_by(TransferQueueTask.priority.asc(), TransferQueueTask.id.desc())
                 .with_for_update(skip_locked=True).limit(1))
         task = (await db.execute(stmt)).scalar_one_or_none()
         if not task:

@@ -91,7 +91,11 @@ class DestinationRouter:
             raise ValueError('target_folder_id (影视转存总目录) is required')
         media_type = str(getattr(resource, 'media_type', 'tv') or 'tv').casefold()
         is_tv = media_type in _TV_TYPES
-        is_complete = not is_tv or (
+        is_already_completed = (
+            watchlist is not None
+            and getattr(watchlist, 'remote_destination_kind', None) == 'completed'
+        )
+        is_complete = not is_tv or is_already_completed or (
             str(operation or 'transfer').casefold() == 'promote'
             and physical_complete
             and cls._is_verified_complete(

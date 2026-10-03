@@ -128,7 +128,7 @@ def evaluate_promotion(
 
     if not ongoing_root or not completed_root:
         decision, reason = "NEEDS_REVIEW", "DESTINATION_ROOT_MISSING"
-    elif season_not_ended or root_status not in _ENDED:
+    elif (season_not_ended or root_status not in _ENDED) and not (total_expected > 0 and collected_count >= total_expected and not collected_key_gap):
         decision, reason = ("SERIES_NOT_READY" if is_multi else "SERIES_NOT_ENDED"), "AUTHORITATIVE_STATUS_NOT_ENDED"
     elif active:
         decision, reason = "ACTIVE_TRANSFER", "ACTIVE_TRANSFER_TASK_EXISTS"

@@ -68,15 +68,12 @@ def resolve_selection_mode(
                 f"unsupported selection_mode={selection_mode!r}",
             ) from exc
     if episode_keys:
+        if len(episode_keys) > 1:
+            return SelectionMode.MISSING_EPISODES
         return SelectionMode.SINGLE_EPISODE
-    # Compatibility for old explicit filename lists: this is a bounded named
-    # collection, never an implicit whole-share selection.
     if expected_files:
         return SelectionMode.COLLECTION
-    raise FileSelectionError(
-        "SELECTION_MODE_REQUIRED",
-        "selection_mode is required when no episode key or explicit file list exists",
-    )
+    return SelectionMode.WHOLE_SHARE
 
 
 def _name(item: dict[str, Any]) -> str:
@@ -117,6 +114,21 @@ def deduplicate_video_files(video_files: list[dict[str, Any]]) -> list[dict[str,
             )
         unique.setdefault(key, item)
     return list(unique.values())
+
+
+def _quality_rank(item: dict[str, Any]) -> tuple[int, int, int, int, int, str, str]:
+    """Deterministically prefer the highest-quality release for the same episode."""
+    name = str(item.get("name") or "").casefold()
+    resolution = 4 if ("2160" in name or "4k" in name) else 3 if "1440" in name else 2 if "1080" in name else 1 if "720" in name else 0
+    source = 3 if "remux" in name else 2 if ("web-dl" in name or "webdl" in name) else 1 if "webrip" in name else 0
+    hdr = 2 if ("dolby vision" in name or "dovi" in name or "dv" in name) else 1 if ("hdr" in name or "hlg" in name) else 0
+    codec = 1 if ("h.265" in name or "h265" in name or "hevc" in name or "x265" in name) else 0
+    size = int(item.get("size") or item.get("fileSize") or item.get("sizeBytes") or 0)
+    return (source, resolution, hdr, codec, size, name, str(item.get("file_id") or ""))
+
+
+def _preferred_file(items: list[dict[str, Any]]) -> dict[str, Any]:
+    return max(items, key=_quality_rank)
 
 
 def _episode_target(episode_keys: list[str] | None, target_episode_key: str | None) -> str | None:
@@ -208,7 +220,14 @@ def select_files(
         if matched_unique_items == []:
             decision = "EPISODE_MISMATCH"
         elif len(matched_unique_items) > 1:
-            decision = "FILE_SELECTION_REVIEW"
+            selected = [_preferred_file(matched_unique_items)]
+            decision = "PREFERRED_SINGLE_EPISODE"
+            if target:
+                canonical_target = canonical_episode_key(season, target)
+                if canonical_target:
+                    requested_episode_keys = [canonical_target]
+                    selected_episode_keys = [canonical_target]
+                    episode_file_map = {canonical_target: selected[0]["file_id"]}
         else:
             selected = matched_unique_items
             decision = "EXACT_SINGLE_EPISODE"
@@ -246,10 +265,8 @@ def select_files(
                     ambiguous = True
                     break
                 previous = by_episode.get(key)
-                if previous is not None and previous["file_id"] != item["file_id"]:
-                    ambiguous = True
-                    break
-                by_episode[key] = item
+                if previous is None or _quality_rank(item) > _quality_rank(previous):
+                    by_episode[key] = item
             if ambiguous:
                 decision = "FILE_SELECTION_REVIEW"
             else:
@@ -279,24 +296,23 @@ def select_files(
     elif mode is SelectionMode.WHOLE_SHARE:
         selected = unique_files
         decision = "WHOLE_SHARE"
-        if season is not None:
-            by_episode: dict[str, dict[str, Any]] = {}
-            for item in selected:
-                keys = extract_video_episode_keys(item["name"], known_season=season)
-                if len(keys) != 1 or not item["file_id"] or int(keys[0][1:3]) != int(season):
-                    decision = "FILE_SELECTION_REVIEW"
-                    selected = []
-                    break
+        by_episode: dict[str, dict[str, Any]] = {}
+        for item in unique_files:
+            keys = extract_video_episode_keys(item["name"], known_season=season)
+            if len(keys) == 1 and item.get("file_id"):
                 key = keys[0]
-                if key in by_episode:
-                    decision = "FILE_SELECTION_REVIEW"
-                    selected = []
-                    break
-                by_episode[key] = item
-            if decision == "WHOLE_SHARE":
-                selected_episode_keys = list(by_episode)
-                requested_episode_keys = list(selected_episode_keys)
-                episode_file_map = {key: item["file_id"] for key, item in by_episode.items()}
+                if season is None or int(key[1:3]) == int(season):
+                    prev = by_episode.get(key)
+                    if prev is None or _quality_rank(item) > _quality_rank(prev):
+                        by_episode[key] = item
+        if by_episode:
+            selected_episode_keys = sorted(by_episode.keys())
+            requested_episode_keys = list(selected_episode_keys)
+            episode_file_map = {key: by_episode[key]["file_id"] for key in selected_episode_keys}
+        else:
+            selected_episode_keys = []
+            requested_episode_keys = []
+            episode_file_map = {}
     else:
         requested_ids = {str(value).strip() for value in (selected_file_ids or []) if str(value).strip()}
         requested_names = {str(value).strip() for value in (selected_file_names or []) if str(value).strip()}
@@ -402,10 +418,10 @@ def assert_selection_scope(result: FileSelectionResult) -> FileSelectionResult:
                 "selected IDs must map one-to-one to every requested missing episode",
             )
     elif result.selection_mode is SelectionMode.WHOLE_SHARE:
-        if not selected or set(selected) != unique:
+        if not selected or not set(selected).issubset(unique):
             raise FileSelectionError(
                 "WHOLE_SHARE_SELECTION_INVALID",
-                "WHOLE_SHARE must explicitly select every unique remote video file",
+                "WHOLE_SHARE selected files must be non-empty and within unique video files",
             )
     elif result.selection_mode is SelectionMode.COLLECTION:
         if result.decision == "COLLECTION_SELECTION_MISMATCH":

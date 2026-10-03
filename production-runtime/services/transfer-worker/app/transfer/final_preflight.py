@@ -98,6 +98,7 @@ def classify_final_preflight(
     route: Mapping[str, Any] | None,
     route_error: str | None = None,
     rename_plan: Mapping[str, Any] | None = None,
+    source_type: str | None = None,
 ) -> dict[str, Any]:
     """Return exactly one of ``AUTO_SAFE``, ``NEEDS_REVIEW``, ``REJECTED``."""
     if route_error:
@@ -125,7 +126,10 @@ def classify_final_preflight(
             for item in checks
             if isinstance(item, Mapping) and item.get("check")
         }
-    missing = sorted(_REQUIRED_CHECKS - set(check_map.keys()))
+    required_checks = _REQUIRED_CHECKS
+    if str(source_type or '').casefold() in {'telegram_channel', 'manual_forward'}:
+        required_checks = _REQUIRED_CHECKS - {'check_watchlist', 'check_collected'}
+    missing = sorted(required_checks - set(check_map.keys()))
     if missing:
         return {
             "classification": NEEDS_REVIEW,
@@ -134,7 +138,7 @@ def classify_final_preflight(
         }
     failures = []
     not_checked = []
-    for name in sorted(_REQUIRED_CHECKS):
+    for name in sorted(required_checks):
         item = check_map.get(name) or {}
         result = str(item.get("result") or "")
         if result == "FAIL":

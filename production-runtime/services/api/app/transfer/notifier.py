@@ -1,3 +1,11 @@
+
+COUNTRY_NAMES = {
+    'CN': '中国大陆', 'HK': '中国香港', 'TW': '中国台湾', 'US': '美国',
+    'JP': '日本', 'KR': '韩国', 'GB': '英国', 'UK': '英国', 'FR': '法国',
+    'DE': '德国', 'IT': '意大利', 'ES': '西班牙', 'TH': '泰国', 'IN': '印度',
+    'CA': '加拿大', 'AU': '澳大利亚', 'RU': '俄罗斯', 'SG': '新加坡'
+}
+
 import html
 import logging
 import re
@@ -128,10 +136,18 @@ def _format_episode_ranges(values: Any) -> str:
 
 
 def _business_status(payload: dict[str, Any], transfer_result: dict[str, Any]) -> str:
+    media_type = str(payload.get("media_type") or "").casefold()
+    if media_type in {"movie", "film", "电影"}:
+        return "全片完结"
     if str(payload.get("promotion_status") or transfer_result.get("promotion_status") or "").upper() == "PROMOTION_COMPLETED":
         return "已完结，已归档"
     status = str(payload.get("series_status") or payload.get("tmdb_series_status") or "").casefold()
-    ended = status in {"ended", "canceled", "cancelled"}
+    try:
+        _tot = int(payload.get("total_episodes") or 0)
+    except (TypeError, ValueError):
+        _tot = 0
+    _col = {str(v).strip() for v in (payload.get("collected_episode_keys") or payload.get("collected_episodes") or []) if str(v).strip()}
+    ended = (status in {"ended", "canceled", "cancelled"}) or (_tot > 0 and len(_col) >= _tot)
     try:
         total = int(payload.get("total_episodes") or 0)
     except (TypeError, ValueError):
@@ -151,8 +167,6 @@ def _business_status(payload: dict[str, Any], transfer_result: dict[str, Any]) -
         ended
         and total > 0
         and len(collected) >= total
-        and inventory_count >= total
-        and cloud_count >= total
         and active_transfer_count == 0
     )
     if ended:
@@ -307,8 +321,21 @@ def build_success_card(*, task_payload: dict[str, Any], transfer_result: dict[st
             except (TypeError, ValueError):
                 continue
 
-    title = html.escape(str(task_payload.get("title") or "影视资源"))
-    region = html.escape(str(task_payload.get("region") or task_payload.get("country") or "未知"))
+    _raw_t = str(task_payload.get("title") or "影视资源")
+    _raw_t = re.sub(r"\s*[\(（][^\)）]*[\)）]", "", _raw_t).strip() or _raw_t
+    _raw_t = re.sub(r"^[📺🎬⭐🍿🖥️📦💾👤📖🏷🎞🆔*\s]+", "", _raw_t).strip() or _raw_t
+    _raw_t = re.sub(r"^\[\s*(?:电视剧|电影|剧集|动漫|纪录片|综艺)(?:[·•][^\]]*)?\s*\]\s*", "", _raw_t).strip() or _raw_t
+    title = html.escape(_raw_t)
+    raw_region = task_payload.get("region") or task_payload.get("country")
+    if not raw_region or str(raw_region).strip() in {"", "未知", "None"}:
+        tmdb_meta = task_payload.get("tmdb_metadata") or {}
+        cat_res = task_payload.get("category_resolution") or {}
+        oc = task_payload.get("origin_country") or tmdb_meta.get("origin_country") or cat_res.get("origin_country")
+        if isinstance(oc, (list, tuple)) and oc:
+            oc = oc[0]
+        if isinstance(oc, str) and oc.strip():
+            raw_region = COUNTRY_NAMES.get(oc.strip().upper(), oc.strip())
+    region = html.escape(str(raw_region or "未知"))
     media_type = "电影" if str(task_payload.get("media_type") or "tv").casefold() in {"movie", "电影"} else "剧集"
     episode_text, episode_count = _episode_display(task_payload, names)
     selected_episode_keys = (
@@ -332,26 +359,30 @@ def build_success_card(*, task_payload: dict[str, Any], transfer_result: dict[st
             collected_keys.add(f"S{int(match.group(1)):02d}E{int(match.group(2)):02d}")
     if media_type == "电影":
         progress_lines = "📦 <b>收录进度：</b>本次已入库\n"
-    elif task_payload.get("collection_progress_verified") and season_number > 0 and total > 0:
-        expected_keys = {f"S{season_number:02d}E{episode:02d}" for episode in range(1, total + 1)}
-        missing_keys = task_payload.get("missing_episode_keys")
-        if missing_keys is None:
-            missing_keys = sorted(expected_keys - collected_keys)
-        else:
-            missing_keys = list(missing_keys)
-        progress_lines = f"📦 <b>收录进度：</b>S{season_number:02d} 已收录 {len(collected_keys)} / {total}\n"
-        if missing_keys:
-            progress_lines += f"❌ <b>当前缺集：</b>{html.escape(_format_episode_ranges(missing_keys))}\n"
-        else:
-            progress_lines += f"✅ <b>本季已收齐：</b>{total}/{total}\n"
+        new_episode_line = ""
     else:
-        progress_lines = "⚠️ <b>收录状态待校验</b>\n"
-    new_episode_line = f"🆕 <b>本次新增：</b>{html.escape(new_episode_text)}\n"
+        if task_payload.get("collection_progress_verified") and season_number > 0 and total > 0:
+            expected_keys = {f"S{season_number:02d}E{episode:02d}" for episode in range(1, total + 1)}
+            missing_keys = task_payload.get("missing_episode_keys")
+            if missing_keys is None:
+                missing_keys = sorted(expected_keys - collected_keys)
+            else:
+                missing_keys = list(missing_keys)
+            progress_lines = f"📦 <b>收录进度：</b>S{season_number:02d} 已收录 {len(collected_keys)} / {total}\n"
+            if missing_keys:
+                progress_lines += f"❌ <b>当前缺集：</b>{html.escape(_format_episode_ranges(missing_keys))}\n"
+            else:
+                progress_lines += f"✅ <b>本季已收齐：</b>{total}/{total}\n"
+        elif task_payload.get("collection_progress_verified") and season_number > 0 and collected_keys:
+            progress_lines = f"📦 <b>收录进度：</b>S{season_number:02d} 已收录 {len(collected_keys)} 集\n"
+        else:
+            progress_lines = "⚠️ <b>收录状态待校验</b>\n"
+        new_episode_line = f"🆕 <b>本次新增：</b>{html.escape(new_episode_text)}\n"
     verified_episode_files = transfer_result.get("verified_episode_files") or []
     verification_count = len(verified_episode_files) if verified_episode_files else len(names)
     business_status = _business_status(task_payload, transfer_result)
     share_url = sanitize_share_url(task_payload.get("share_url") or task_payload.get("candidate_share_url"))
-    share_line = f'<a href="{html.escape(share_url, quote=True)}">{html.escape(share_url)}</a>' if share_url else "未提供可用分享链接"
+    share_line = f'<a href="{html.escape(share_url, quote=True)}">{html.escape(share_url)}</a>' if share_url else "未提供可用分享链接" 
     destination = html.escape(str(task_payload.get("archive_directory") or task_payload.get("remote_rel_path") or task_payload.get("season_folder_name") or "影视转存总目录"))
     caption = (
         f"🎞 <b>片名：</b>{title}\n"
@@ -365,7 +396,7 @@ def build_success_card(*, task_payload: dict[str, Any], transfer_result: dict[st
         "☁️ <b>资源网盘：</b>#光鸭\n"
         f"🔗 <b>分享链接：</b>{share_line}\n"
         f"📁 <b>归档目录：</b>{destination}\n"
-        f"📄 <b>已核验文件：</b>{html.escape(', '.join(names) or '—')}\n"
+        f"📄 <b>已核验文件：</b>{html.escape((', '.join(names) if len(names) <= 3 else f'{names[0]}, {names[1]} ... {names[-1]}（共 {len(names)} 个文件）') or '—')}\n"
         f"✨ <b>智能去重：</b>✅ 转存成功（已确认 {len(names)} 个文件入库）\n"
         f"👤 <b>感谢贡献：</b>{html.escape(_contributor(task_payload))}\n"
         f"✅ <b>入库验证：</b>本次已核验 {verification_count} 个文件"
@@ -396,6 +427,169 @@ def build_promotion_card(*, task_payload: dict[str, Any], promotion_result: dict
     )
 
 
+
+def fetch_tmdb_presentation_meta(payload: dict[str, Any]):
+    pass
+
+async def fetch_tmdb_presentation_meta(payload: dict[str, Any]) -> dict[str, Any]:
+    """Fetch rich display metadata (cast, first_air_date, vote_average, overview) from TMDB."""
+    tmdb_id = payload.get("tmdb_id")
+    if not tmdb_id:
+        return {}
+    try:
+        from app.core.config import get_settings
+        import httpx
+        settings = get_settings()
+        if not settings.tmdb_api_key:
+            return {}
+        media_type = "movie" if str(payload.get("media_type") or "tv").casefold() in {"movie", "电影"} else "tv"
+        base = settings.tmdb_base_url.rstrip("/")
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(
+                f"{base}/{media_type}/{int(tmdb_id)}",
+                params={"api_key": settings.tmdb_api_key, "language": "zh-CN", "append_to_response": "credits"}
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                credits = data.get("credits") or {}
+                cast_names = [c.get("name") for c in credits.get("cast") or [] if c.get("name")]
+                return {
+                    "first_air_date": data.get("first_air_date") or data.get("release_date") or "",
+                    "vote_average": data.get("vote_average"),
+                    "cast": " / ".join(cast_names[:4]) if cast_names else "",
+                    "overview": (data.get("overview") or "").strip(),
+                    "origin_country": (data.get("origin_country") or [""])[0] if isinstance(data.get("origin_country"), list) else "",
+                }
+    except Exception as exc:
+        logger.debug("Failed to fetch TMDB presentation meta: %s", exc)
+    return {}
+
+
+
+def build_publish_card(*, task_payload: dict[str, Any], transfer_result: dict[str, Any]) -> SuccessCard:
+    """Build public-facing resource sharing card (Template 1) for PUBLISH_ONLY channel."""
+    selected = task_payload.get("selected_file_names") or task_payload.get("selected_verified_names")
+    if not selected:
+        selected = transfer_result.get("selected_file_names") or transfer_result.get("remote_files") or []
+    names = tuple(dict.fromkeys(str(name).strip() for name in selected if str(name).strip()))
+    
+    sizes = transfer_result.get("selected_file_sizes") or task_payload.get("selected_file_sizes") or {}
+    total_size = 0
+    if isinstance(sizes, dict):
+        for name in names:
+            try:
+                total_size += int(sizes.get(name) or 0)
+            except (TypeError, ValueError):
+                continue
+    if not total_size:
+        for record in transfer_result.get("remote_file_records") or []:
+            if isinstance(record, dict) and str(record.get("name") or record.get("fileName") or "").strip() in names:
+                try:
+                    total_size += int(record.get("size") or record.get("fileSize") or 0)
+                except (TypeError, ValueError):
+                    continue
+
+    raw_title = str(task_payload.get("title") or "影视资源")
+    title = re.sub(r"^.*?给你分享了[：:\s]*", "", raw_title)
+    title = re.sub(r"[，,]\s*点击链接.*$", "", title)
+    title = re.sub(r"\{tmdb[\s\-:_]*\d+\}", "", title, flags=re.I).strip(" ：:，,。") or raw_title
+    title = re.sub(r"\s*[\(（][^\)）]*[\)）]", "", title).strip() or title
+    title = re.sub(r"^[📺🎬⭐🍿🖥️📦💾👤📖🏷🎞🆔*\s]+", "", title).strip() or title
+    
+    tmdb_id = task_payload.get("tmdb_id") or ""
+    year = task_payload.get("year") or ""
+    if not year and task_payload.get("first_air_date"):
+        year = str(task_payload.get("first_air_date"))[:4]
+    year_str = f" ({year})" if year else ""
+    
+    spec = _specification(task_payload, names)
+    spec_str = f" {spec}" if spec and spec != "其他" else ""
+    
+    raw_region = task_payload.get("region") or task_payload.get("country")
+    if not raw_region or str(raw_region).strip() in {"", "未知", "None"}:
+        oc = task_payload.get("origin_country")
+        if isinstance(oc, (list, tuple)) and oc:
+            oc = oc[0]
+        if isinstance(oc, str) and oc.strip():
+            raw_region = COUNTRY_NAMES.get(oc.strip().upper(), oc.strip())
+    region = str(raw_region or "中国大陆")
+    
+    first_air = task_payload.get("first_air_date") or task_payload.get("release_date") or ""
+    cast = task_payload.get("cast") or ""
+    vote = task_payload.get("vote_average")
+    vote_str = f"{float(vote):.1f} / 10" if vote and float(vote) > 0 else "暂无评分"
+    
+    media_type = "电影" if str(task_payload.get("media_type") or "tv").casefold() in {"movie", "电影"} else "剧集"
+    
+    season_number = int(task_payload.get("season") or 1)
+    total_ep = int(task_payload.get("total_episodes") or 0)
+    col_ep = task_payload.get("collected_episodes") or task_payload.get("collected_episode_keys") or []
+    raw_eps = col_ep or task_payload.get("selected_episode_keys") or task_payload.get("episode_keys") or []
+    range_str = _format_episode_ranges(raw_eps)
+    ep_cnt = len(raw_eps) or len(names)
+    if media_type == "电影":
+        progress_str = "全片完结"
+    elif total_ep > 0 and len(col_ep) >= total_ep:
+        progress_str = f"S{season_number:02d} 全 {total_ep} 集完结"
+    elif range_str and range_str != "—":
+        if len(range_str) > 35:
+            progress_str = f"S{season_number:02d} 已收录 {ep_cnt} 集"
+        else:
+            progress_str = f"更新至 {range_str}（共 {ep_cnt} 集）" if ep_cnt > 1 else f"更新至 {range_str}"
+    elif ep_cnt > 0:
+        progress_str = f"S{season_number:02d} 已收录 {ep_cnt} 集"
+    else:
+        progress_str = f"第 {season_number} 季热播中"
+        
+    size_str = _format_size(total_size)
+    
+    overview = (task_payload.get("overview") or "").strip()
+    if overview:
+        if len(overview) > 160:
+            overview = overview[:155].rstrip() + "..."
+        overview_block = f"\n📝 <b>简介：</b>\n{html.escape(overview)}\n"
+    else:
+        overview_block = ""
+        
+    # 专属网盘分享链接：必须使用自己网盘生成的直达链接
+    my_share = task_payload.get("my_share_url") or transfer_result.get("my_share_url")
+    if my_share:
+        share_line = f"🔗 <a href=\"{html.escape(my_share, quote=True)}\">{html.escape(my_share)}</a>"
+    else:
+        share_line = "🔗 <i>正在生成专属云盘链接...</i>"
+        
+    caption = (
+        f"🎬 <b>《{html.escape(title)}》</b>{html.escape(year_str)}{html.escape(spec_str)}\n"
+        f"🆔 <b>TMDb：</b><code>{html.escape(str(tmdb_id))}</code>\n\n"
+    )
+    if first_air:
+        caption += f"📅 <b>首播：</b>{html.escape(str(first_air))}\n"
+    caption += f"🌐 <b>地区：</b>{html.escape(region)}\n"
+    if cast:
+        caption += f"👥 <b>主演：</b>{html.escape(cast)}\n"
+    caption += (
+        f"⭐️ <b>评分：</b>{html.escape(vote_str)}\n"
+        f"🎞 <b>进度：</b>{html.escape(progress_str)}\n"
+    )
+    if total_size > 0:
+        caption += f"💾 <b>体积：</b>{html.escape(size_str)}\n"
+    caption += (
+        f"{overview_block}\n"
+        f"☁️ <b>光鸭云盘（专属分享）：</b>\n"
+        f"{share_line}"
+    )
+    
+    poster = _poster_url(task_payload)
+    return SuccessCard(
+        caption=caption,
+        poster_url=poster,
+        poster_status="POSTER_AVAILABLE" if poster else "POSTER_UNAVAILABLE",
+        business_status="已转存入库",
+        selected_file_names=names,
+        selected_size_bytes=total_size,
+    )
+
+
 class TransferNotifier:
     """Send transfer notifications through an explicit, validated target resolver.
 
@@ -410,6 +604,7 @@ class TransferNotifier:
         admin_tg_id: int | None | object = _UNSET,
         default_channel_id: str | None | object = _UNSET,
         success_chat: str | None | object = _UNSET,
+        publish_chat: str | None | object = _UNSET,
     ) -> None:
         settings = get_settings()
         self.bot_token = bot_token if bot_token is not None else settings.telegram_bot_token
@@ -418,6 +613,7 @@ class TransferNotifier:
             settings.failure_notification_chat if default_channel_id is _UNSET else default_channel_id
         )
         self.success_chat = settings.transfer_success_chat if success_chat is _UNSET else success_chat
+        self.publish_chat = settings.resource_publish_chat if publish_chat is _UNSET else publish_chat
 
     @staticmethod
     def is_valid_chat_identifier(value: object) -> bool:
@@ -661,6 +857,14 @@ class TransferNotifier:
             return None
         return NotificationTarget(chat_id=normalized, source="transfer_success_chat")
 
+    def resolve_publish_target(self, publish_chat: object = _UNSET) -> NotificationTarget | None:
+        """Return the public resource publishing channel target."""
+        configured = self.publish_chat if publish_chat is _UNSET else publish_chat
+        normalized = self._normalize_chat_identifier(configured)
+        if normalized is None:
+            return None
+        return NotificationTarget(chat_id=normalized, source="resource_publish_chat")
+
     async def notify_success_result(
         self,
         *,
@@ -687,26 +891,84 @@ class TransferNotifier:
             enriched_payload.setdefault("episode_keys", [resource.episode_key] if resource.episode_key else [])
             enriched_payload.setdefault("share_url", resource.share_url)
             enriched_payload.setdefault("source_type", resource.source_type)
+                # 1. 尝试丰富 TMDB 影视卡片元数据（主演、首播、评分、简介）
+        try:
+            tmdb_meta = await fetch_tmdb_presentation_meta(enriched_payload)
+            if tmdb_meta:
+                for k, v in tmdb_meta.items():
+                    if v and not enriched_payload.get(k):
+                        enriched_payload[k] = v
+        except Exception:
+            pass
+
+        # 2. 如果缺少自己网盘专属链接，实时自动兜底创建
+        if not enriched_payload.get("my_share_url") and not transfer_result.get("my_share_url"):
+            folder_id = transfer_result.get("remote_folder_id") or enriched_payload.get("remote_folder_id")
+            if folder_id:
+                try:
+                    from app.core.database import AsyncSessionLocal
+                    from app.models.cloud import CloudConfig
+                    from app.transfer.adapters.guangya import GuangyaAdapter
+                    from app.transfer.guangya_auth import GuangyaCredentialStore
+                    from sqlalchemy import select
+                    async with AsyncSessionLocal() as db:
+                        cfg = await db.scalar(select(CloudConfig).where(CloudConfig.name == "guangya"))
+                        if cfg and cfg.auth_ref:
+                            adapter = GuangyaAdapter(write_enabled=True, credential_store=GuangyaCredentialStore(AsyncSessionLocal))
+                            my_url = await adapter.create_share_link(
+                                folder_id=str(folder_id),
+                                title=str(enriched_payload.get("title") or "影视分享"),
+                                auth_token=str(cfg.auth_ref)
+                            )
+                            if my_url:
+                                enriched_payload["my_share_url"] = my_url
+                                transfer_result["my_share_url"] = my_url
+                except Exception as exc:
+                    logger.warning("Auto fallback share link creation failed: %s", exc)
+
         poster_resolution = await resolve_poster_url(enriched_payload)
         if poster_resolution.get("url"):
             enriched_payload["poster_url"] = poster_resolution["url"]
         card = build_success_card(task_payload=enriched_payload, transfer_result=transfer_result)
+        
+        # 1. Send success notification to transfer_success_chat
+        primary_result = None
         if card.poster_url:
             photo_result = await self._send_telegram_photo_result(target, card.poster_url, card.caption)
             if photo_result.sent:
-                return photo_result
-            logger.warning("Poster notification failed; falling back to text: %s", photo_result.error)
-        text_result = await self._send_telegram_result(target, card.caption)
-        if text_result.sent and (card.poster_status == "POSTER_UNAVAILABLE" or not card.poster_url):
-            return NotificationResult(
-                text_result.status,
-                text_result.sent,
-                target_chat_id=text_result.target_chat_id,
-                target_source=text_result.target_source,
-                error="POSTER_UNAVAILABLE",
-                telegram_message_id=text_result.telegram_message_id,
-            )
-        return text_result
+                primary_result = photo_result
+            else:
+                logger.warning("Poster notification failed; falling back to text: %s", photo_result.error)
+        if primary_result is None:
+            text_result = await self._send_telegram_result(target, card.caption)
+            if text_result.sent and (card.poster_status == "POSTER_UNAVAILABLE" or not card.poster_url):
+                primary_result = NotificationResult(
+                    text_result.status,
+                    text_result.sent,
+                    target_chat_id=text_result.target_chat_id,
+                    target_source=text_result.target_source,
+                    error="POSTER_UNAVAILABLE",
+                    telegram_message_id=text_result.telegram_message_id,
+                )
+            else:
+                primary_result = text_result
+
+        # 2. Also publish public resource card to resource_publish_chat
+        publish_target = self.resolve_publish_target(enriched_payload.get("resource_publish_chat", _UNSET))
+        if publish_target and publish_target.chat_id:
+            try:
+                pub_card = build_publish_card(task_payload=enriched_payload, transfer_result=transfer_result)
+                if pub_card.poster_url:
+                    pub_res = await self._send_telegram_photo_result(publish_target, pub_card.poster_url, pub_card.caption)
+                    if not pub_res.sent:
+                        await self._send_telegram_result(publish_target, pub_card.caption)
+                else:
+                    await self._send_telegram_result(publish_target, pub_card.caption)
+                logger.info("Successfully published resource card to %s", publish_target.chat_id)
+            except Exception as pub_exc:
+                logger.warning("Failed to publish resource card to %s: %s", publish_target.chat_id, pub_exc)
+
+        return primary_result
 
     async def notify_success(
         self,

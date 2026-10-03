@@ -44,7 +44,7 @@ class Resource(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    identity_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    identity_key: Mapped[str] = mapped_column(Text, nullable=False)
     tmdb_id: Mapped[int | None] = mapped_column(Integer)
     title: Mapped[str | None] = mapped_column(String(512))
     media_type: Mapped[str] = mapped_column(String(32), default='tv', nullable=False)

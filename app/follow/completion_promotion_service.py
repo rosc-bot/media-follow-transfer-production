@@ -23,7 +23,7 @@ from app.models.watchlist import SeriesWatchlist
 from app.transfer.destination_routing import DestinationRouter
 from app.transfer.normalization import build_idempotency_key
 from app.transfer.queue_service import TransferQueueService
-from app.transfer.status import EXECUTION_ACTIVE_STATUSES
+from app.transfer.status import EXECUTION_ACTIVE_STATUSES, is_execution_active_task
 
 _ACTIVE_TRANSFER_STATUSES = EXECUTION_ACTIVE_STATUSES
 
@@ -76,6 +76,8 @@ class CompletionPromotionService:
         } if resource_ids else {}
         count = 0
         for task in rows:
+            if not is_execution_active_task(task):
+                continue
             payload = dict(task.payload or {})
             if str(payload.get("operation") or "").casefold() == "promote":
                 continue

@@ -23,6 +23,18 @@ EXECUTION_ACTIVE_STATUSES = frozenset({
 REVIEW_STATUS = 'PENDING'
 
 
+def is_execution_active_task(task: object) -> bool:
+    """A review-fenced queued row is not claimable and cannot reserve an episode."""
+    status = str(getattr(task, 'status', '') or '').strip().upper()
+    if status not in EXECUTION_ACTIVE_STATUSES:
+        return False
+    if status == 'RUNNING':
+        return True
+    payload = getattr(task, 'payload', None) or {}
+    classification = str(payload.get('preflight_classification') or '').strip().upper()
+    return classification not in {'NEEDS_REVIEW', 'REJECTED'}
+
+
 SUCCESS_TERMINAL_STATUSES = frozenset({
     TransferStatus.SUCCESS,
     TransferStatus.COMPLETED,

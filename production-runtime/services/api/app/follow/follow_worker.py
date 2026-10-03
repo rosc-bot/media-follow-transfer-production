@@ -79,7 +79,8 @@ async def _collect_promotion_physical_evidence(
                 or not seasons
             ):
                 raise RuntimeError('PROMOTION_PHYSICAL_SCAN_IDENTITY_OR_PROVIDER_UNAVAILABLE')
-            adapter = GuangyaAdapter(write_enabled=False)
+            store = GuangyaCredentialStore(AsyncSessionLocal)
+            adapter = GuangyaAdapter(write_enabled=False, credential_store=store)
             scan = await adapter.scan_series_root_readonly(
                 auth_token=str(config.auth_ref),
                 tmdb_id=tmdb_id,
@@ -124,6 +125,13 @@ async def run_follow_cycle(
     if await BotSettingsService.is_follow_paused(db):
         logger.info('Follow cycle skipped: follow pause is enabled')
         return {'synced_watchlists': 0, 'scout_jobs': 0}
+
+    try:
+        from app.follow.master_inventory_scanner import MasterInventoryScanner
+        scan_res = await MasterInventoryScanner.scan_and_sync()
+        logger.info("MasterInventoryScanner cycle result: %s", scan_res)
+    except Exception as exc:
+        logger.warning("MasterInventoryScanner failed in follow cycle: %s", exc)
 
     synced = await ScheduleService(calendar).sync_watchlist(db)
     discovered = await LegacyRootDiscoveryService(_list_legacy_directories).backfill(db)

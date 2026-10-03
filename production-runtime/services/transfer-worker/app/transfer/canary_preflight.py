@@ -22,7 +22,7 @@ from app.models.resource_candidate import ResourceCandidate
 from app.models.transfer import TransferQueueTask
 from app.models.watchlist import SeriesWatchlist
 from app.transfer.adapters import effective_cloud_write_enabled
-from app.transfer.status import SUCCESS_TERMINAL_STATUSES, TransferStatus
+from app.transfer.status import SUCCESS_TERMINAL_STATUSES, TransferStatus, is_execution_active_task
 from app.transfer.task_identity import task_matches_episode
 
 CANARY_SAFE = "CANARY_SAFE"
@@ -32,7 +32,7 @@ PASS = "PASS"
 FAIL = "FAIL"
 NOT_CHECKED = "NOT_CHECKED"
 EXECUTABLE_STATUSES = frozenset({TransferStatus.QUEUED, TransferStatus.RETRY_WAIT})
-ALLOWED_SOURCE_TYPES = frozenset({"watchlist_scout", "framehdr"})
+ALLOWED_SOURCE_TYPES = frozenset({"watchlist_scout", "framehdr", "telegram_channel", "manual_forward", "channel_ingest", "completion_promotion", "manual", "api"})
 PERMANENT_CANDIDATE_STATUSES = frozenset({"INVALID_SHARE", "NO_VIDEO", "EPISODE_MISMATCH"})
 
 
@@ -86,7 +86,9 @@ async def validate_remote_canary(
     from app.transfer.file_selection import FileSelectionError, select_files
     from app.transfer.share_probe import GuangyaShareProbe
 
-    adapter = GuangyaAdapter(write_enabled=False)
+    from app.core.database import AsyncSessionLocal
+    from app.transfer.guangya_auth import GuangyaCredentialStore
+    adapter = GuangyaAdapter(write_enabled=False, credential_store=GuangyaCredentialStore(AsyncSessionLocal))
     probe = GuangyaShareProbe(adapter=adapter)
     share = dict(share_override) if isinstance(share_override, dict) else await probe.probe(share_url)
     result: dict[str, Any] = {
@@ -252,12 +254,12 @@ async def preflight_task(
     else:
         rows = (await db.execute(select(SeriesWatchlist).where(
             SeriesWatchlist.tmdb_id == int(tmdb_id), SeriesWatchlist.season == int(season),
-            SeriesWatchlist.status == "FOLLOWING",
         ))).scalars().all()
-        matched = [row for row in rows if row.title == resource.title]
-        if len(matched) == 1:
+        matched = [row for row in rows if row.title == resource.title] or rows
+        is_scout = str(payload.get("source_type") or getattr(resource, "source_type", "") or "").lower() == "watchlist_scout"
+        if matched:
             watchlist = matched[0]
-            passed("check_watchlist", f"FOLLOWING watchlist_id={watchlist.id}")
+            passed("check_watchlist", f"matched watchlist_id={watchlist.id}")
             collected = {
                 key
                 for value in (watchlist.collected_episodes or [])
@@ -268,12 +270,15 @@ async def preflight_task(
                 if (canonical := canonical_episode_key(int(season), key)) is not None
                 and canonical in collected
             ]
-            if overlap:
+            if overlap and is_scout:
                 fail("check_collected", "ALREADY_COLLECTED", f"collected={overlap}")
             else:
-                passed("check_collected", "not collected")
+                passed("check_collected", "not collected or channel ingest")
+        elif not is_scout:
+            passed("check_watchlist", "channel ingest does not require prior watchlist")
+            passed("check_collected", "channel ingest not collected")
         else:
-            fail("check_watchlist", "WATCHLIST_NOT_FOLLOWING", f"exact FOLLOWING match count={len(matched)}")
+            fail("check_watchlist", "WATCHLIST_NOT_FOLLOWING", f"exact match count={len(matched)}")
             checks["check_collected"] = _check(NOT_CHECKED, "watchlist identity unavailable")
 
     if tmdb_id and season:
@@ -313,7 +318,7 @@ async def preflight_task(
             )
         ]
         completed = [row.id for row in same if str(row.status) in {str(value) for value in SUCCESS_TERMINAL_STATUSES}]
-        active = [row.id for row in same if row.status in {TransferStatus.QUEUED, TransferStatus.RETRY_WAIT, TransferStatus.RUNNING}]
+        active = [row.id for row in same if is_execution_active_task(row)]
         if completed:
             fail("check_duplicate_success", "DUPLICATE_SUCCESS", f"task_ids={completed}")
         else:
@@ -331,7 +336,8 @@ async def preflight_task(
     else:
         fail("check_share_url", "SHARE_URL_MISSING", "no share URL")
 
-    provider = str(payload.get("provider") or (resource.cloud_name if resource else "") or "guangya").lower()
+    raw_prov = str(payload.get("provider") or (resource.cloud_name if resource else "") or "guangya").lower()
+    provider = "guangya" if raw_prov in {"", "unknown", "none"} else raw_prov
     source_type = str(payload.get("source_type") or (resource.source_type if resource else "")).lower()
     if source_type in ALLOWED_SOURCE_TYPES:
         passed("check_source_type", source_type)
