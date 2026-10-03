@@ -9,6 +9,7 @@ from app.core.database import Base
 from app.models import import_all_models
 from app.models.bot_settings import BotSettings
 from app.models.transfer import TransferQueueTask
+from app.models.resource import Resource
 from app.follow.bot_settings_service import BotSettingsService
 from app.transfer.queue_service import TransferQueueService
 from app.transfer.queue_worker import TransferQueueWorker
@@ -26,9 +27,14 @@ async def verify():
             await connection.run_sync(Base.metadata.create_all)
         async with sessions() as db, db.begin():
             db.add_all([BotSettings(key='global_pause',val='0'),BotSettings(key='transfer_paused',val='0')])
-            good = await TransferQueueService.enqueue(db, resource_id=None, provider='dry-run', episode_keys=['S01E01'], payload={'preflight_classification':'AUTO_SAFE'})
+            db.add_all([
+                Resource(id=11,identity_key='verification-good',share_url='https://invalid.example/verification/good',source_type='unit-test',title='verification-good',tmdb_id=7,media_type='tv',season=1,episode_key='S01E01',cloud_name='dry-run'),
+                Resource(id=12,identity_key='verification-bad',share_url='https://invalid.example/verification/bad',source_type='unit-test',title='verification-bad',tmdb_id=7,media_type='tv',season=1,episode_key='S01E02',cloud_name='guangya'),
+            ])
+            await db.flush()
+            good = await TransferQueueService.enqueue(db, resource_id=11, provider='dry-run', episode_keys=['S01E01'], payload={'preflight_classification':'AUTO_SAFE'})
             good_id = good.id
-            bad = await TransferQueueService.enqueue(db, resource_id=None, provider='guangya', episode_keys=['S01E02'], payload={'preflight_classification':'AUTO_SAFE'})
+            bad = await TransferQueueService.enqueue(db, resource_id=12, provider='guangya', episode_keys=['S01E02'], payload={'preflight_classification':'AUTO_SAFE'})
             bad_id = bad.id
         worker = TransferQueueWorker(sessions, worker_id='isolated-postgres-verification')
         assert await worker.process_once() is False
