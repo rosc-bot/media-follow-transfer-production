@@ -20,7 +20,7 @@ class _Events:
 
 
 class _FakeClient:
-    def __init__(self, *_args):
+    def __init__(self, *_args, **_kwargs):
         self.handlers = []
         self.connected = False
 

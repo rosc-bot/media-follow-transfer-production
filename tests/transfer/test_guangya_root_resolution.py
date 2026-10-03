@@ -164,6 +164,33 @@ async def test_flat_root_files_do_not_get_a_new_season_child_during_upgrade():
 
 
 @pytest.mark.asyncio
+async def test_known_root_hint_does_not_hide_duplicate_lifecycle_root():
+    adapter = LayoutAdapter({
+        "ongoing-root": [{"fileId": "ongoing-series", "name": "剧名 (2024) {tmdbid-73456}", "resType": 2}],
+        "completed-root": [{"fileId": "completed-series", "name": "剧名 (2024) {tmdbid-73456}【完结】", "resType": 2}],
+        "ongoing-series": [],
+    })
+    payload = _payload()
+    payload['remote_series_folder_id'] = 'ongoing-series'
+    with pytest.raises(FileSelectionError) as exc:
+        await _prepare(adapter, payload)
+    assert exc.value.code == 'DUPLICATE_TMDB_ROOT'
+    assert adapter.write_calls == []
+
+
+@pytest.mark.asyncio
+async def test_root_scan_timeout_never_authorizes_new_directory_creation():
+    class TimedOutAdapter(LayoutAdapter):
+        async def _find_tmdb_series_roots_readonly(self, *args, **kwargs):
+            raise TimeoutError('unit incomplete root scan')
+    adapter = TimedOutAdapter({'ongoing-root': [], 'completed-root': []})
+    with pytest.raises(FileSelectionError) as exc:
+        await _prepare(adapter, _payload())
+    assert exc.value.code == 'TMDB_ROOT_SCAN_TIMEOUT'
+    assert adapter.write_calls == []
+
+
+@pytest.mark.asyncio
 async def test_untagged_same_display_title_blocks_creation_as_identity_unverified():
     adapter = LayoutAdapter({
         "ongoing-root": [],

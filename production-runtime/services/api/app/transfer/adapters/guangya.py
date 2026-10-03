@@ -934,50 +934,28 @@ class GuangyaAdapter(BaseAdapter):
             completed_id = str(current_root_id or '').strip()
         if not ongoing_id or not completed_id or ongoing_id == completed_id:
             raise FileSelectionError('TMDB_ROOT_SCAN_BOTH_LIFECYCLE_ROOTS_REQUIRED', 'both ongoing and completed root IDs must be configured')
-        known_folder_id = str(payload.get('remote_series_folder_id') or payload.get('series_folder_id') or '').strip()
         roots = [('ongoing', ongoing_id), ('completed', completed_id)]
         matches: list[dict] = []
         unidentified: list[dict] = []
         try:
             async with asyncio.timeout(90.0):
-                # 优先快速探测已知目录是否存在
-                if known_folder_id:
-                    try:
-                        info_items = await self._list_folder_items(client, parent_id=known_folder_id, ctx=ctx)
-                        # 如果能正常访问，说明该目录真实有效存在，构造轻量级 match
-                        name = str(payload.get('series_folder_name') or expected_name or '').strip()
-                        matches.append({
-                            'folder_id': known_folder_id,
-                            'name': name,
-                            'parent_id': ongoing_id if destination_kind == 'ongoing' else completed_id,
-                            'path': f'{media_root}/{name}',
-                            'kind': destination_kind or 'ongoing',
-                        })
-                    except Exception:
-                        pass
-
-                if not matches:
-                    for kind, root_id in roots:
-                        found, unknown = await self._find_tmdb_series_roots_readonly(
-                            client,
-                            root_id=root_id,
-                            root_kind=kind,
-                            media_root=media_root,
-                            tmdb_id=int(tmdb_id),
-                            expected_name=expected_name,
-                            ctx=ctx,
-                            max_directories=25,
-                        )
-                        matches.extend(found)
-                        unidentified.extend(unknown)
-                        if matches:
-                            break
+                # A known folder ID is a hint, not identity/lifecycle evidence.
+                # Check BOTH roots completely before authorizing any directory write.
+                for kind, root_id in roots:
+                    found, unknown = await self._find_tmdb_series_roots_readonly(
+                        client,
+                        root_id=root_id,
+                        root_kind=kind,
+                        media_root=media_root,
+                        tmdb_id=int(tmdb_id),
+                        expected_name=expected_name,
+                        ctx=ctx,
+                        max_directories=25,
+                    )
+                    matches.extend(found)
+                    unidentified.extend(unknown)
         except TimeoutError as exc:
-            if matches:
-                pass
-            else:
-                logger.warning('TMDB_ROOT_SCAN_TIMEOUT ignored, fallback to default category layout')
-                return None
+            raise FileSelectionError('TMDB_ROOT_SCAN_TIMEOUT', 'both lifecycle root scans must complete before writing') from exc
         if len(matches) > 1:
             raise FileSelectionError('DUPLICATE_TMDB_ROOT', f'tmdb_id={int(tmdb_id)} matches={len(matches)}')
         if unidentified:
@@ -1056,9 +1034,7 @@ class GuangyaAdapter(BaseAdapter):
             if not parsed and requested_name in {'S01', 'Season 1', '第一季'} and int(season) == 1:
                 payload.pop('season_folder_name', None)
                 return series_id
-            logger.warning('MIXED_SINGLE_SEASON_LAYOUT bypassed, using series_id directly')
-            payload.pop('season_folder_name', None)
-            return series_id
+            raise FileSelectionError('MIXED_SINGLE_SEASON_LAYOUT', 'loose season files cannot be used as another season directory')
         if not requested_name and not parsed:
             payload.pop('season_folder_name', None)
             return series_id
