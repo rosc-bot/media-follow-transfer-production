@@ -100,7 +100,7 @@ class TelegramGateway:
 
         # Single TelegramClient with single persistent session
         logger.info("Initializing TelegramClient with session: %s", self.session_path)
-        self.client = TelegramClient(self.session_path, self.api_id, self.api_hash)
+        self.client = TelegramClient(self.session_path, self.api_id, self.api_hash, catch_up=True)
 
         @self.client.on(events.NewMessage())
         async def on_new_message(event):
@@ -136,4 +136,7 @@ async def run_gateway() -> None:
         summary_db_path=settings.summary_db_path,
         resource_db_path=settings.resource_db_path,
     )
-    await gateway.start()
+    try:
+        await gateway.start()
+    finally:
+        await gateway.stop()
