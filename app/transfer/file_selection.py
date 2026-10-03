@@ -124,7 +124,7 @@ def _quality_rank(item: dict[str, Any]) -> tuple[int, int, int, int, int, str, s
     hdr = 2 if ("dolby vision" in name or "dovi" in name or "dv" in name) else 1 if ("hdr" in name or "hlg" in name) else 0
     codec = 1 if ("h.265" in name or "h265" in name or "hevc" in name or "x265" in name) else 0
     size = int(item.get("size") or item.get("fileSize") or item.get("sizeBytes") or 0)
-    return (source, resolution, hdr, codec, size, name, str(item.get("file_id") or ""))
+    return (resolution, source, hdr, codec, size, name, str(item.get("file_id") or ""))
 
 
 def _preferred_file(items: list[dict[str, Any]]) -> dict[str, Any]:

@@ -11,7 +11,7 @@ from app.models.resource import Resource
 from app.models.transfer import TransferQueueTask
 from app.transfer.errors import NON_RETRYABLE_CATEGORIES, TransferErrorCategory
 from app.transfer.normalization import build_idempotency_key
-from app.transfer.status import REVIEW_STATUS, SUCCESS_TERMINAL_STATUSES, TransferStatus
+from app.transfer.status import SUCCESS_TERMINAL_STATUSES, TransferStatus, is_execution_active_task
 
 
 @dataclass(frozen=True)
@@ -128,24 +128,12 @@ class TransferQueueService:
         existing = await db.scalar(select(TransferQueueTask).where(TransferQueueTask.idempotency_key == key))
         if existing is not None:
             is_success = str(existing.status) in {str(value) for value in SUCCESS_TERMINAL_STATUSES}
-            is_review = str(existing.status) == REVIEW_STATUS
-            if is_review and not is_success:
-                existing.status = TransferStatus.QUEUED
-                existing.error_message = None
-                existing.locked_at = None
-                existing.locked_by = None
-                existing.next_run_at = datetime.now(UTC)
-                await db.flush()
-                return EnqueueResult(
-                    existing,
-                    created=False,
-                    reused=True,
-                    deduplicated=False,
-                )
+            # Idempotent discovery is not an operator approval. Preserve review
+            # holds and terminal failures instead of silently making them runnable.
             return EnqueueResult(
                 existing,
                 created=False,
-                reused=not is_success and not is_review,
+                reused=is_execution_active_task(existing),
                 deduplicated=is_success,
             )
 
@@ -208,7 +196,10 @@ class TransferQueueService:
                 .where(
                     TransferQueueTask.status.in_([TransferStatus.QUEUED, TransferStatus.RETRY_WAIT]),
                     TransferQueueTask.next_run_at <= now,
-                    True,
+                    or_(
+                        preflight_classification.is_(None),
+                        func.upper(func.trim(preflight_classification)).not_in(['NEEDS_REVIEW', 'REJECTED']),
+                    ),
                 )
                 .order_by(TransferQueueTask.priority.asc(), TransferQueueTask.id.desc())
                 .with_for_update(skip_locked=True).limit(1))

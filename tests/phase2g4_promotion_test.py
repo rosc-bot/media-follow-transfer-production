@@ -23,6 +23,10 @@ class PromotionResumeOrchestrator:
     async def execute(self, payload):
         self.calls.append(dict(payload))
         if len(self.calls) == 1:
+            # The adapter recorded a successful root move before readback
+            # failed. An unverified exception alone must not invent this fence.
+            payload["promotion_stage"] = "MOVED"
+            payload["promotion_series_folder_id"] = "series-folder"
             raise PromotionUnverifiedError(
                 "completed readback missing S01E02",
                 series_folder_id="series-folder",

@@ -1,11 +1,12 @@
 import pytest
+from unittest.mock import AsyncMock
 
 from app.transfer.adapters.guangya import GuangyaAdapter
 
 
 class RefreshingGuangyaAdapter(GuangyaAdapter):
     def __init__(self):
-        super().__init__(write_enabled=True)
+        super().__init__(write_enabled=True, credential_store=AsyncMock())
         self.refreshed = None
         self.restore_headers = None
 
@@ -22,7 +23,7 @@ class RefreshingGuangyaAdapter(GuangyaAdapter):
             self.restore_headers = headers
             return {'code': 0, 'data': {}}
         if url.endswith('/file/get_file_list'):
-            return {'code': 0, 'data': {'list': [{'name': 'episode.mkv', 'resType': 1}], 'hasMore': False}}
+            return {'code': 0, 'data': {'list': [{'fileId': 'remote-1', 'name': 'episode.mkv', 'resType': 1}], 'hasMore': False}}
         raise AssertionError(url)
 
 
@@ -40,4 +41,5 @@ async def test_guangya_adapter_refreshes_access_token_before_restore_when_only_r
 
     assert outcome.verified is True
     assert adapter.refreshed == 'gy.refresh-token'
+    adapter.credential_store.persist_refresh.assert_awaited_once_with('guangya', {'access_token': 'fresh-access-token'})
     assert adapter.restore_headers.get('authorization') == 'Bearer fresh-access-token'

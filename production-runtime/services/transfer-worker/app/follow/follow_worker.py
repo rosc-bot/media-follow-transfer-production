@@ -123,7 +123,7 @@ async def run_follow_cycle(
 ) -> dict[str, Any]:
     """Sync TMDB metadata first, then scout only the still-missing episodes."""
     if await BotSettingsService.is_follow_paused(db):
-        logger.info('Follow cycle skipped: follow pause is enabled')
+        logger.debug('Follow cycle skipped: follow pause is enabled')
         return {'synced_watchlists': 0, 'scout_jobs': 0}
 
     try:

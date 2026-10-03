@@ -1478,33 +1478,46 @@ class TransferQueueWorker:
         """Claim one task and hydrate its payload; returns (task_id, resource_id, payload)."""
         async with self.session_factory() as db:
             if await BotSettingsService.is_transfer_paused(db):
-                logger.info('Transfer queue consumption skipped: transfer pause is enabled')
+                logger.debug('Transfer queue consumption skipped: transfer pause is enabled')
                 return None
         if not await self._provider_claim_allowed():
             logger.info('Transfer queue consumption deferred by Guangya provider circuit')
             return None
         async with self.session_factory() as db, db.begin():
             if await BotSettingsService.is_transfer_paused(db):
-                logger.info('Transfer queue consumption skipped: transfer pause is enabled')
+                logger.debug('Transfer queue consumption skipped: transfer pause is enabled')
                 return None
             task = await TransferQueueService.claim_next(db, worker_id=self.worker_id)
             if not task:
                 return None
             payload = {}
             try:
-                payload = await self._hydrate_payload(db, task)
-                resource = await db.get(Resource, task.resource_id) if task.resource_id is not None else None
-                if not payload.get('selection_mode') and resource is not None and resource.season:
-                    canonical_keys = {
-                        key
-                        for value in (payload.get('episode_keys') or ([resource.episode_key] if resource.episode_key else []))
-                        if (key := canonical_episode_key(int(resource.season), value)) is not None
-                    }
-                    if len(canonical_keys) > 1:
-                        payload['selection_mode'] = 'MISSING_EPISODES'
-                gate = await self._final_local_preflight(db, task, payload)
+                # Keep the claim/attempt outside a savepoint: a bad task must
+                # not roll back its claim counter or starve the rest of the queue.
+                # Hydration mutations, however, must not survive a failed preflight.
+                async with db.begin_nested():
+                    payload = await self._hydrate_payload(db, task)
+                    resource = await db.get(Resource, task.resource_id) if task.resource_id is not None else None
+                    if not payload.get('selection_mode') and resource is not None and resource.season:
+                        canonical_keys = {
+                            key
+                            for value in (payload.get('episode_keys') or ([resource.episode_key] if resource.episode_key else []))
+                            if (key := canonical_episode_key(int(resource.season), value)) is not None
+                        }
+                        if len(canonical_keys) > 1:
+                            payload['selection_mode'] = 'MISSING_EPISODES'
+                    gate = await self._final_local_preflight(db, task, payload)
             except DestinationMetadataIncomplete as exc:
+                await db.refresh(task)
+                payload = {}
                 gate = ('NEEDS_REVIEW', str(exc))
+            except (RuntimeError, ValueError, TypeError) as exc:
+                # These are task/configuration faults, not failed cloud writes.
+                # Database/transport failures still propagate rather than being
+                # acknowledged from an unhealthy database transaction.
+                await db.refresh(task)
+                payload = {}
+                gate = ('NEEDS_REVIEW', f'TASK_HYDRATION_ERROR: {_safe_preflight_detail(exc)}')
             if gate is not None:
                 classification, reason = gate
                 if any(k in str(reason) for k in ('ALREADY_COLLECTED', 'ALREADY_IN_CLOUD', 'DUPLICATE_SUCCESS_TASK', 'RECONCILED_ALREADY_IN_CLOUD')):
@@ -1810,7 +1823,9 @@ class TransferQueueWorker:
                         'size': remote_record.get('size') or remote_record.get('fileSize') or 0,
                     }
                 for name in verified_files:
-                    if name not in verified_episode_by_name:
+                    # A supplied explicit readback map must be complete; only
+                    # legacy adapters without a map may derive it from names.
+                    if not verified_episode_files and name not in verified_episode_by_name:
                         from app.transfer.episode_matcher import extract_video_episode_keys
                         p_keys = extract_video_episode_keys(name, known_season=resource.season)
                         ep_key = p_keys[0] if len(p_keys) == 1 else (next(iter(expected_episode_keys)) if len(expected_episode_keys) == 1 else None)
@@ -1830,12 +1845,11 @@ class TransferQueueWorker:
                     set(verified_episode_by_name) != set(verified_files)
                     or observed_episode_keys != expected_episode_keys
                 ):
-                    episode_integrity_error = None
+                    episode_integrity_error = 'VERIFIED_EPISODE_MAP_INCOMPLETE'
                 if episode_integrity_error:
-                    pass  # Never globally pause all workers on a single task error
-                    task.status = TransferStatus.RETRY_WAIT
+                    task.status = 'PENDING'
                     task.next_run_at = datetime.now(UTC)
-                    task.error_message = f'[SYSTEM_PAUSE:{episode_integrity_error}] verified readback closure is incomplete'[:4000]
+                    task.error_message = f'[TASK_REVIEW:{episode_integrity_error}] verified readback closure is incomplete'[:4000]
                     task.payload = {
                         **dict(task.payload or {}),
                         **payload,
@@ -1855,7 +1869,7 @@ class TransferQueueWorker:
                     task.locked_at = None
                     task.locked_by = None
                     await db.flush()
-                    logger.critical('transfer_paused=1: task=%s %s', task_id, episode_integrity_error)
+                    logger.error('Task held for review: task=%s %s', task_id, episode_integrity_error)
                     return False
                 transfer_result['verified_episode_files'] = list(verified_episode_by_name.values())
                 transfer_result['selected_episode_keys'] = sorted(observed_episode_keys)
@@ -1989,16 +2003,17 @@ class TransferQueueWorker:
                 and resource.season is not None
                 and inventory_result.get('status') != 'SYNCED'
             ):
-                pass  # Never globally pause all workers on a single task error
-                task.status = TransferStatus.RETRY_WAIT
+                task.status = 'PENDING'
                 task.next_run_at = datetime.now(UTC)
-                task.error_message = '[SYSTEM_PAUSE:INVENTORY_SYNC_FAILED] verified files are not fully inventoried'[:4000]
+                task.error_message = '[TASK_REVIEW:INVENTORY_SYNC_FAILED] verified files are not fully inventoried'[:4000]
                 task.payload = {
                     **dict(task.payload or {}),
                     'execution_stage': 'RENAME_VERIFIED',
                     'remote_folder_id': outcome.remote_folder_id,
                     'selected_file_names': verified_files,
                     'verified_remote_records': list(outcome.remote_file_records or ()),
+                    'preflight_classification': 'NEEDS_REVIEW',
+                    'preflight_reason': 'INVENTORY_SYNC_FAILED',
                 }
                 task.result = {
                     **dict(task.result or {}),
@@ -2008,7 +2023,7 @@ class TransferQueueWorker:
                 task.locked_at = None
                 task.locked_by = None
                 await db.flush()
-                logger.critical('transfer_paused=1: task=%s Inventory closure failed', task_id)
+                logger.error('Task held for review: task=%s Inventory closure failed', task_id)
                 return False
             verified_episode_keys = list(dict.fromkeys(
                 str(record['episode_key'])

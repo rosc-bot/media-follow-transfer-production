@@ -13,6 +13,7 @@ Covers:
 """
 
 import json
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -28,8 +29,10 @@ from app.transfer.errors import (
     TransferErrorCategory,
 )
 from app.transfer.guangya_auth import (
+    GuangyaAuthContext,
     GuangyaCredentialProvider,
     GuangyaCredentialStore,
+    REFRESH_MAX_ATTEMPTS,
     build_auth_ref,
     sanitize_token,
 )
@@ -46,6 +49,7 @@ class GuangyaAdapterStub(GuangyaAdapter):
     """Rebinds post(); the auth wrapper treats post() as the transport."""
 
     def __init__(self, *args, **kwargs):
+        kwargs.setdefault('credential_store', AsyncMock(spec=GuangyaCredentialStore))
         super().__init__(*args, **kwargs)
         self.post_calls = 0
         self.headers_seen: list[str | None] = []
@@ -115,6 +119,38 @@ async def test_expired_access_401_refresh_then_retry_success():
     assert adapter.post_calls == 2
     assert adapter.headers_seen == ['Bearer expired-access', 'Bearer new-access']
     assert [folder['name'] for folder in folders] == ['ongoing']
+
+
+@pytest.mark.asyncio
+async def test_readback_401_refreshes_once_and_keeps_the_request_chain_context():
+    provider = RecordingProvider()
+    store = AsyncMock(spec=GuangyaCredentialStore)
+    adapter = GuangyaAdapter(credential_provider=provider, credential_store=store)
+    ctx = GuangyaAuthContext(access_token='expired-access', refresh_token='refresh-old')
+    seen = []
+
+    def respond(request):
+        seen.append((request.headers.get('authorization'), json.loads(request.content)))
+        if len(seen) == 1:
+            return httpx.Response(401)
+        return httpx.Response(200, json={
+            'code': 0, 'data': {'list': [{'fileId': 'remote-1', 'name': 'episode.mkv', 'resType': 1}], 'hasMore': False},
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        verified, observed = await adapter._readback_until_verified(
+            client, target_id='target', ctx=ctx, expected={'episode.mkv'}, attempts=1, interval_seconds=0,
+        )
+
+    assert verified is True and observed == {'episode.mkv'}
+    assert [auth for auth, _ in seen] == ['Bearer expired-access', 'Bearer new-access']
+    assert seen[0][1] == seen[1][1]
+    assert {key: seen[0][1][key] for key in ('page', 'pageSize', 'orderBy', 'sortType')} == {
+        'page': 0, 'pageSize': 200, 'orderBy': 3, 'sortType': 1,
+    }
+    assert provider.calls == 1
+    assert ctx.refreshed_this_chain is True
+    store.persist_refresh.assert_awaited_once_with('guangya', {'access_token': 'new-access'})
 
 
 @pytest.mark.asyncio
@@ -420,7 +456,7 @@ async def test_final_refresh_timeout_reports_stage_and_keeps_network_category():
     with pytest.raises(GuangyaTransferError) as caught:
         await GuangyaCredentialProvider().refresh_access(server, "refresh-secret-value")
 
-    assert server.calls == 2
+    assert server.calls == REFRESH_MAX_ATTEMPTS
     assert caught.value.category == TransferErrorCategory.NETWORK_TIMEOUT
     assert "endpoint_type=account" in str(caught.value)
     assert "stage=RESPONSE_READ" in str(caught.value)

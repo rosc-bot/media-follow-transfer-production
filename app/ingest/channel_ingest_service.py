@@ -28,6 +28,7 @@ from app.ingest.media_identity import (
 )
 from app.ingest.resource_link_extractor import ResourceLinkExtractor
 from app.ingest.url_extractor import extract_urls
+from app.models.cloud import CloudDiskInventory
 from app.models.ingest import ChannelIngestJob, ChannelIngestMessage
 from app.models.resource import Resource
 from app.models.transfer import TransferJob, TransferQueueTask

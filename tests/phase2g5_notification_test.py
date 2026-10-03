@@ -34,6 +34,7 @@ async def test_success_route_ignores_payload_redirect_and_uses_resource_share_ur
         bot_token="123456:FAKE_TOKEN",
         admin_tg_id=8586984520,
         success_chat="@guangyazhauncun",
+        publish_chat="@guangyaziyuanfenxiang",
     )
     resource = Resource(
         identity_key="test-notify",
@@ -64,7 +65,15 @@ async def test_success_route_ignores_payload_redirect_and_uses_resource_share_ur
             resource=resource,
         )
     assert result.sent is True
-    body = post.call_args.kwargs["json"]
+    assert result.target_chat_id == "@guangyazhauncun"
+    assert result.target_source == "transfer_success_chat"
+    assert post.await_count == 2
+    assert [call.kwargs["json"]["chat_id"] for call in post.await_args_list] == [
+        "@guangyazhauncun", "@guangyaziyuanfenxiang",
+    ]
+    body = post.await_args_list[0].kwargs["json"]
     assert body["chat_id"] == "@guangyazhauncun"
     assert "real-share" in body["text"]
-    assert "access_token" not in body["text"]
+    assert all("access_token" not in call.kwargs["json"]["text"] for call in post.await_args_list)
+    # The public card must not publish the source owner's share as our own.
+    assert "real-share" not in post.await_args_list[1].kwargs["json"]["text"]

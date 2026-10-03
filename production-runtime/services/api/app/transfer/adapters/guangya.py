@@ -91,14 +91,22 @@ class GuangyaAdapter(BaseAdapter):
 
     @staticmethod
     def response_ok(data: dict) -> bool:
-        return str(data.get('code', '')).strip() in {'0', '200'} or data.get('msg', '').lower() in {'', 'ok', 'success'}
+        # An explicit business error takes precedence over msg (including a
+        # missing/null msg). Keep legacy success responses containing data.
+        if 'code' in data:
+            return str(data['code']).strip() in {'0', '200'}
+        message = str(data.get('msg') or '').strip().lower()
+        if message:
+            return message in {'ok', 'success'}
+        return 'data' in data
 
     # Business codes that mean "the bearer credential is not accepted".
     # NOTE: Guangya answers missing pagination parameters with HTTP 200 +
     # code 112 ("参数错误") — that is a request-parameter error, NOT an auth
-    # rejection (verified live 2026-09-21). Auth rejections are HTTP 401/403
-    # only, so this set is intentionally empty; do not add 112 back.
-    AUTH_BUSINESS_CODES = frozenset()
+    # rejection. HTTP 200 + code 117 (无效token) is a bearer credential
+    # rejection and must get the same bounded refresh flow as HTTP 401/403.
+    # Never add parameter-error code 112 here.
+    AUTH_BUSINESS_CODES = frozenset({'117'})
 
     #: get_file_list succeeds only when these pagination fields are present
     #: (live-verified: 200 + code 112 "参数错误" without them, 200 success with
@@ -140,14 +148,14 @@ class GuangyaAdapter(BaseAdapter):
             value = payload.get(key, data.get(key))
             if value is not None:
                 try:
-                    return page < int(value)
+                    return page + 1 < int(value)
                 except (TypeError, ValueError):
                     pass
         for key in ('total', 'totalCount', 'count'):
             value = payload.get(key, data.get(key))
             if value is not None:
                 try:
-                    return page * page_size < int(value)
+                    return (page + 1) * page_size < int(value)
                 except (TypeError, ValueError):
                     pass
         return item_count >= page_size
@@ -227,6 +235,11 @@ class GuangyaAdapter(BaseAdapter):
         data = response.json()
         if not isinstance(data, dict) or not self.response_ok(data):
             code = data.get('code') if isinstance(data, dict) else 'invalid-response'
+            if str(code).strip() == '157':
+                raise GuangyaTransferError(
+                    TransferErrorCategory.INSUFFICIENT_SPACE,
+                    'guangya API rejected request: 157 (空间不足，请检查容量或会员状态)',
+                )
             if isinstance(data, dict) and str(code).strip() in self.AUTH_BUSINESS_CODES:
                 # Business-level auth rejection: surface it as an HTTP-status style
                 # error carrying the response so _authorized_post can refresh & retry.
@@ -244,7 +257,7 @@ class GuangyaAdapter(BaseAdapter):
         ctx: GuangyaAuthContext,
     ) -> dict:
         """Issue an authenticated POST; on auth rejection (HTTP 401/403 or business
-        code 112) refresh once (if possible) and retry once.
+        code 117) refresh once (if possible) and retry once.
 
         Refresh failure of the credential kind is always surfaced as
         :class:`GuangyaAuthExpiredError`; retryable refresh failures (429, 5xx,
@@ -256,8 +269,10 @@ class GuangyaAdapter(BaseAdapter):
         try:
             return await self.post(client, url, payload, headers)
         except httpx.HTTPStatusError as exc:
-            if not self._auth_rejection(exc) or ctx.refreshed_this_chain or not ctx.refresh_token:
+            if not self._auth_rejection(exc):
                 raise
+            if ctx.refreshed_this_chain or not ctx.refresh_token:
+                raise GuangyaAuthExpiredError() from exc
             try:
                 access, refresh = await self.credential_provider.refresh_access(client, ctx.refresh_token)
             except GuangyaTransferError as refresh_exc:
@@ -293,6 +308,7 @@ class GuangyaAdapter(BaseAdapter):
         page_key: str,
         page_size: int,
         max_pages: int,
+        ctx: GuangyaAuthContext | None = None,
     ) -> list[dict]:
         collected: list[dict] = []
         signatures: set[str] = set()
@@ -304,7 +320,10 @@ class GuangyaAdapter(BaseAdapter):
                 'page': page,
                 'pageSize': page_size,
             }
-            data = await self.post(client, url, page_payload, headers)
+            if ctx is not None:
+                data = await self._authorized_post(client, url, page_payload, ctx)
+            else:
+                data = await self.post(client, url, page_payload, headers)
             items = self._items(data)
             if not items:
                 return collected
@@ -463,6 +482,7 @@ class GuangyaAdapter(BaseAdapter):
                 page_key='pageNum',
                 page_size=200,
                 max_pages=100,
+                ctx=ctx,
             )
             observed = {
                 str(item.get('name') or item.get('fileName')).strip()

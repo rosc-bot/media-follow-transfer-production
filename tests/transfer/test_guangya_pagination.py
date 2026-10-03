@@ -3,6 +3,20 @@ import pytest
 from app.transfer.adapters.guangya import GuangyaAdapter
 
 
+@pytest.mark.parametrize('metadata,page,expected', [
+    ({'totalPages': 1}, 0, False),
+    ({'totalPages': 2}, 0, True),
+    ({'totalPages': 2}, 1, False),
+    ({'total': 20}, 0, False),
+    ({'total': 21}, 0, True),
+    ({'total': 21}, 1, False),
+])
+def test_pagination_metadata_uses_zero_based_page_numbers(metadata, page, expected):
+    assert GuangyaAdapter._has_more(
+        {'code': 0, 'data': metadata}, page=page, page_size=20, item_count=20,
+    ) is expected
+
+
 class ScriptedGuangyaAdapter(GuangyaAdapter):
     def __init__(self):
         super().__init__(write_enabled=True)
@@ -22,7 +36,7 @@ class ScriptedGuangyaAdapter(GuangyaAdapter):
         if url.endswith('/file/get_file_list'):
             self.target_reads += 1
             files = [] if self.target_reads == 1 else [
-                {'name': 'one.mkv', 'resType': 1}, {'name': 'two.mkv', 'resType': 1},
+                {'fileId': 'remote-1', 'name': 'one.mkv', 'resType': 1}, {'fileId': 'remote-2', 'name': 'two.mkv', 'resType': 1},
             ]
             return {'code': 0, 'data': {'list': files, 'hasMore': False}}
         raise AssertionError(url)
@@ -73,8 +87,8 @@ class NestedFolderGuangyaAdapter(GuangyaAdapter):
             return {'code': 0, 'data': {}}
         if url.endswith('/file/get_file_list'):
             return {'code': 0, 'data': {'list': [
-                {'name': 'S01E01.mkv', 'resType': 1},
-                {'name': 'S01E02.mkv', 'resType': 1},
+                {'fileId': 'remote-ep1', 'name': 'S01E01.mkv', 'resType': 1},
+                {'fileId': 'remote-ep2', 'name': 'S01E02.mkv', 'resType': 1},
             ], 'hasMore': False}}
         raise AssertionError(url)
 

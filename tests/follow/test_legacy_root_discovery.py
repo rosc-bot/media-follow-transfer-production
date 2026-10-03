@@ -10,7 +10,8 @@ from app.models.watchlist import SeriesWatchlist
 
 
 @pytest.mark.asyncio
-async def test_legacy_discovery_backfills_only_one_exact_tmdb_marked_ongoing_root(tmp_path):
+@pytest.mark.parametrize("category_path", [(), ("国产剧",), ("电视剧", "国产剧")])
+async def test_legacy_discovery_backfills_only_one_exact_tmdb_marked_ongoing_root(tmp_path, category_path):
     engine = create_async_engine(f'sqlite+aiosqlite:///{tmp_path}/legacy-discovery.db')
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
@@ -32,8 +33,16 @@ async def test_legacy_discovery_backfills_only_one_exact_tmdb_marked_ongoing_roo
                      cloud_name='guangya', share_url='https://pan.guangyapan.com/s/34', source_type='watchlist_scout'),
         ])
 
+    listed_parents = []
+
     async def list_directories(*, provider, auth_token, parent_id):
-        assert (provider, auth_token, parent_id) == ('guangya', 'test-auth', 'ongoing-root')
+        assert (provider, auth_token) == ('guangya', 'test-auth')
+        expected_parents = ['ongoing-root', *[f'category-{i}' for i in range(len(category_path))]]
+        assert parent_id in expected_parents, 'must not traverse inside a marked series root'
+        listed_parents.append(parent_id)
+        depth = expected_parents.index(parent_id)
+        if depth < len(category_path):
+            return [{'fileId': f'category-{depth}', 'name': category_path[depth], 'resType': 2}]
         return [
             {'fileId': 'folder-12', 'name': '可回填 (2025) {tmdbid-12}', 'resType': 2},
             {'fileId': 'folder-34a', 'name': '歧义拒绝 A {tmdbid-34}', 'resType': 2},

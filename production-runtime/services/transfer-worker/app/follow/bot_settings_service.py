@@ -27,15 +27,20 @@ class BotSettingsService:
         """Return the value for *key*, falling back to ``BotSettings.DEFAULTS``
         then to *default*.  A missing key with a known default is **not** auto-
         persisted — call ``set()`` explicitly if persistence is desired."""
-        row = (await db.execute(select(BotSettings).where(BotSettings.key == key))).scalar_one_or_none()
-        if row is not None:
-            return row.val
+        # Select the scalar column, not an ORM entity: retained BotSettings
+        # identities in expire_on_commit=False sessions must not cache pause gates.
+        # Normal autoflush still exposes this session's own pending setting writes.
+        val = await db.scalar(select(BotSettings.val).where(BotSettings.key == key))
+        if val is not None:
+            return val
         return BotSettings.DEFAULTS.get(key, default)
 
     @staticmethod
     async def set(db: AsyncSession, key: str, val: str) -> None:
         """Upsert *key* = *val*.  Commits are left to the caller / session middleware."""
-        row = (await db.execute(select(BotSettings).where(BotSettings.key == key))).scalar_one_or_none()
+        row = (await db.execute(
+            select(BotSettings).where(BotSettings.key == key).execution_options(populate_existing=True)
+        )).scalar_one_or_none()
         if row is not None:
             row.val = val
         else:

@@ -79,7 +79,11 @@ def test_completed_library_keeps_meaningful_source_names_without_remote_rename()
 
 @pytest.mark.asyncio
 async def test_success_card_is_rich_and_uses_send_photo_with_fixed_success_route():
-    notifier = TransferNotifier(bot_token="123456:FAKE_TOKEN", success_chat="@guangyazhauncun")
+    notifier = TransferNotifier(
+        bot_token="123456:FAKE_TOKEN",
+        success_chat="@guangyazhauncun",
+        publish_chat="@guangyaziyuanfenxiang",
+    )
     payload = {
         "title": "测试剧",
         "season": 1,
@@ -105,13 +109,24 @@ async def test_success_card_is_rich_and_uses_send_photo_with_fixed_success_route
         post.return_value = response
         sent = await notifier.notify_success_result(task_payload=payload, transfer_result=result)
     assert sent.status == "SENT"
-    assert post.call_args.args[0].endswith("/sendPhoto")
-    assert post.call_args.kwargs["json"]["chat_id"] == "@guangyazhauncun"
+    assert sent.target_chat_id == "@guangyazhauncun"
+    assert post.await_count == 2
+    assert [call.kwargs["json"]["chat_id"] for call in post.await_args_list] == [
+        "@guangyazhauncun", "@guangyaziyuanfenxiang",
+    ]
+    assert all(call.args[0].endswith("/sendPhoto") for call in post.await_args_list)
+    primary_body = post.await_args_list[0].kwargs["json"]
+    assert primary_body["photo"] == payload["poster_url"]
+    assert primary_body["caption"] == card.caption
 
 
 @pytest.mark.asyncio
 async def test_success_card_falls_back_to_text_when_poster_unavailable():
-    notifier = TransferNotifier(bot_token="123456:FAKE_TOKEN", success_chat="@guangyazhauncun")
+    notifier = TransferNotifier(
+        bot_token="123456:FAKE_TOKEN",
+        success_chat="@guangyazhauncun",
+        publish_chat="@guangyaziyuanfenxiang",
+    )
     payload = {"title": "无海报剧", "season": 1, "episode_keys": ["S01E01"], "poster_url": ""}
     result = {"verified": True, "remote_files": ["S01E01.mkv"]}
     response = httpx.Response(200, json={"ok": True, "result": {"message_id": 89}}, request=httpx.Request("POST", "https://example.invalid"))
@@ -119,8 +134,17 @@ async def test_success_card_falls_back_to_text_when_poster_unavailable():
         post.return_value = response
         sent = await notifier.notify_success_result(task_payload=payload, transfer_result=result)
     assert sent.sent is True
-    assert post.call_args.args[0].endswith("/sendMessage")
-    assert "POSTER_UNAVAILABLE" in sent.as_dict().get("error", "") or "无海报剧" in post.call_args.kwargs["json"]["text"]
+    assert sent.status == "SENT"
+    assert sent.error == "POSTER_UNAVAILABLE"
+    assert sent.target_chat_id == "@guangyazhauncun"
+    assert post.await_count == 2
+    assert [call.kwargs["json"]["chat_id"] for call in post.await_args_list] == [
+        "@guangyazhauncun", "@guangyaziyuanfenxiang",
+    ]
+    assert all(call.args[0].endswith("/sendMessage") for call in post.await_args_list)
+    assert post.await_args_list[0].kwargs["json"]["text"] == build_success_card(
+        task_payload=payload, transfer_result=result,
+    ).caption
 
 
 @pytest.mark.parametrize(

@@ -22,7 +22,8 @@ class RepeatedSharePageAdapter(GuangyaAdapter):
                 {"fileId": str(index), "name": f"Show.S01E{index:02d}.mkv", "resType": 1}
                 for index in range(1, 21)
             ]
-            return {"code": 0, "data": {"total": 20, "list": files}}
+            # No explicit hasMore or total: the defensive second-page probe is necessary.
+            return {"code": 0, "data": {"list": files}}
         raise AssertionError(url)
 
 

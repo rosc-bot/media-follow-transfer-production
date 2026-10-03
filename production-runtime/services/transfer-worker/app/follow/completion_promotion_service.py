@@ -140,12 +140,15 @@ class CompletionPromotionService:
         seasons: list[dict[str, Any]] = []
         expected_files: dict[str, list[str]] = {}
         active_total = 0
-        for row in all_rows:
-            season = int(row.season or 1)
+        rows_by_season = {int(row.season or 1): row for row in all_rows}
+        # Moving a series root moves every season. Evaluate the full TMDB
+        # season list, including seasons not yet represented in Watchlist.
+        for season in sorted(set(rows_by_season) | set(tmdb_episode_counts)):
+            row = rows_by_season.get(season)
             total = int(tmdb_episode_counts.get(season) or 0)
             collected = {
                 key
-                for value in (row.collected_episodes or [])
+                for value in (getattr(row, 'collected_episodes', None) or [])
                 if (key := canonical_episode_key(season, value)) is not None
             }
             inventory = {

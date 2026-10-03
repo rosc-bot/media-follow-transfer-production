@@ -148,6 +148,7 @@ async def test_success_route_is_fixed_and_failure_route_never_uses_source_role()
         admin_tg_id=8586984520,
         default_channel_id="-1000000000000",
         success_chat="@guangyazhauncun",
+        publish_chat="@guangyaziyuanfenxiang",
     )
     success_response = httpx.Response(200, json={"ok": True, "result": {"message_id": 501}}, request=httpx.Request("POST", "https://example.com"))
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as post:
@@ -159,7 +160,10 @@ async def test_success_route_is_fixed_and_failure_route_never_uses_source_role()
         assert result.sent is True
         assert result.target_chat_id == "@guangyazhauncun"
         assert result.target_source == "transfer_success_chat"
-        assert post.call_args.kwargs["json"]["chat_id"] == "@guangyazhauncun"
+        assert post.await_count == 2
+        assert [call.kwargs["json"]["chat_id"] for call in post.await_args_list] == [
+            "@guangyazhauncun", "@guangyaziyuanfenxiang",
+        ]
 
         failure = await notifier.notify_failure_result(
             task_payload={"title": "失败", "source_channel_id": "framehdr", "requester_chat_id": "framehdr"},
@@ -171,6 +175,8 @@ async def test_success_route_is_fixed_and_failure_route_never_uses_source_role()
         assert failure.sent is True
         assert failure.target_chat_id == 8586984520
         assert failure.target_source != "source_channel_id"
+        assert post.await_count == 3
+        assert post.await_args_list[2].kwargs["json"]["chat_id"] == 8586984520
         assert "未知错误" not in post.call_args.kwargs["json"]["text"]
 
 

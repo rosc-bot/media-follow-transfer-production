@@ -406,10 +406,18 @@ def build_rename_plan(
 
     for record in selected_records:
         old_name = record["name"]
-        # 严格执行规范中文命名：只有当原文件名已经包含中文片名且包含 tmdbid 标识时才视为已规范化而保持
-        clean_t = str(title or "").strip()
-        already_standard = bool(clean_t and clean_t in old_name and (f"tmdbid-{int(tmdb_id)}" in old_name.lower() if tmdb_id else True))
-        if already_standard:
+        # Movies and verified complete TV packages retain meaningful source
+        # titles/aliases. Returning or incomplete series still normalize every
+        # selected episode, even when its English release name is meaningful.
+        preserve_source_name = is_movie or (
+            complete and (
+                str(series_status or "").strip().casefold() in _ENDED_STATUSES
+                or (lifecycle_verified and destination_kind == "completed")
+            )
+        )
+        if preserve_source_name and has_meaningful_media_name(
+            old_name, media_type=media_type, title=title, aliases=aliases,
+        ):
             decision_by_id[record["file_id"]] = "KEEP"
             skipped.append(record["file_id"])
             continue

@@ -1,27 +1,26 @@
+import httpx
 import pytest
-from app.transfer.notifier import TransferNotifier, NotificationResult
+
 
 @pytest.fixture(autouse=True)
 def mock_telegram_notifier(monkeypatch):
-    """Globally mock TransferNotifier to prevent real telegram messages from leaking during tests."""
-    async def fake_notify_success(self, *args, **kwargs):
-        return NotificationResult(
-            sent=True,
-            target_chat_id="@mock_chat",
-            target_source="mock",
-            telegram_message_id=99999,
-        )
-    async def fake_notify_failure(self, *args, **kwargs):
-        return NotificationResult(
-            sent=True,
-            target_chat_id="@mock_chat",
-            target_source="mock",
-            telegram_message_id=99999,
-        )
-    monkeypatch.setattr(TransferNotifier, "notify_success_result", fake_notify_success)
-    monkeypatch.setattr(TransferNotifier, "notify_failure_result", fake_notify_failure)
-    monkeypatch.setattr(TransferNotifier, "notify_success", fake_notify_success)
-    monkeypatch.setattr(TransferNotifier, "notify_failure", fake_notify_failure)
-    monkeypatch.setattr(TransferNotifier, "_send_telegram", fake_notify_success)
-    monkeypatch.setattr(TransferNotifier, "_send_telegram_photo_result", fake_notify_success)
-    monkeypatch.setattr(TransferNotifier, "_send_telegram_result", fake_notify_success)
+    """Fail closed at HTTP I/O; keep real notifier routing/cards/results intact.
+
+    Notification tests must explicitly mock HTTP requests. Intercept both HTTPX
+    transports so an omitted mock can never emit a real Telegram message.
+    """
+    original_async = httpx.AsyncHTTPTransport.handle_async_request
+    original_sync = httpx.HTTPTransport.handle_request
+
+    async def guarded_async_request(self, request):
+        if request.url.host == "api.telegram.org":
+            raise httpx.ConnectError("Telegram network access is disabled in tests", request=request)
+        return await original_async(self, request)
+
+    def guarded_sync_request(self, request):
+        if request.url.host == "api.telegram.org":
+            raise httpx.ConnectError("Telegram network access is disabled in tests", request=request)
+        return original_sync(self, request)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", guarded_async_request)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", guarded_sync_request)

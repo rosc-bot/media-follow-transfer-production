@@ -111,6 +111,40 @@ def test_plan_only_touches_selected_verified_file():
     assert "other" not in {operation.file_id for operation in plan.operations}
 
 
+@pytest.mark.parametrize(
+    "media_type,origin_country,production_countries,expected",
+    [
+        ("tv", ["US", "CN"], [], "欧美剧"),
+        ("tv", ["JP", "CN"], [], "日韩剧"),
+        ("tv", ["CN", "US"], [], "国产剧"),
+        ("tv", ["ZZ", "US"], [], "其他剧"),
+        ("movie", [], [{"iso_3166_1": "US"}, {"iso_3166_1": "CN"}], "欧美电影"),
+        ("tv", ["US"], [{"iso_3166_1": "CN"}], "欧美剧"),
+    ],
+)
+def test_canonical_category_uses_tmdb_primary_country_not_coproducer_or_language(
+    media_type, origin_country, production_countries, expected,
+):
+    from app.transfer.canonical_destination import CanonicalDestinationBuilder
+
+    metadata = {
+        "id": 123, "media_type": media_type,
+        "origin_country": origin_country, "production_countries": production_countries,
+        "original_language": "zh", "genres": [{"id": 18, "name": "Drama"}],
+        "metadata_complete": True, "seasons": [{"season_number": 1}],
+    }
+    resolution = CanonicalDestinationBuilder.resolve_category(metadata)
+    assert resolution.category == expected
+    for kind in ("ongoing", "completed"):
+        destination = CanonicalDestinationBuilder.build(
+            metadata=metadata, tmdb_id=123, title="作品", year=2026,
+            media_type=media_type, destination_kind=kind,
+            season=1 if media_type == "tv" else None,
+        )
+        assert destination.media_category == expected
+        assert f"/{expected}/作品 (2026) {{tmdbid-123}}" in destination.inventory_prefix
+
+
 async def _poster_fetcher(tmdb_id, payload):
     assert tmdb_id in {328303, 328304}
     return {"poster_path": "/cached-by-provider.jpg"}

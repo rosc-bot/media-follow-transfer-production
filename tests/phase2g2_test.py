@@ -132,7 +132,7 @@ async def test_scan_dry_run_is_zero_write_and_apply_converges(sessions):
 
 
 @pytest.mark.asyncio
-async def test_inventory_sync_failure_pauses_transfer_without_replaying_restore(sessions, monkeypatch):
+async def test_inventory_sync_failure_holds_task_without_replaying_restore(sessions, monkeypatch):
     from app.models.bot_settings import BotSettings
     from app.models.watchlist import SeriesWatchlist
     from app.transfer.orchestrator import TransferOrchestrator
@@ -189,10 +189,13 @@ async def test_inventory_sync_failure_pauses_transfer_without_replaying_restore(
         final_task = await db.get(TransferQueueTask, task.id)
         inventory_count = await db.scalar(select(func.count(CloudDiskInventory.id)))
         pause = await db.get(BotSettings, "transfer_paused")
-        assert final_task.status == TransferStatus.RETRY_WAIT
+        assert final_task.status == 'PENDING'
         assert final_task.result["inventory"]["status"] == "INVENTORY_SYNC_FAILED"
         assert final_task.result["integrity_error"] == "INVENTORY_SYNC_FAILED"
-        assert pause.val == "1"
+        assert final_task.payload['preflight_classification'] == 'NEEDS_REVIEW'
+        assert final_task.payload['execution_stage'] == 'RENAME_VERIFIED'
+        assert final_task.locked_at is None and final_task.locked_by is None
+        assert pause.val == "0"
         assert inventory_count == 0
     assert await worker.process_once() is False
     assert adapter.calls == 1

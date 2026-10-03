@@ -58,18 +58,17 @@ def test_single_episode_zero_match_is_episode_mismatch():
     assert excinfo.value.category == TransferErrorCategory.EPISODE_MISMATCH
 
 
-def test_multiple_unique_matches_require_file_selection_review():
+def test_multiple_quality_variants_select_the_single_best_match():
     files = _share_files()
     files.append({"fileId": "file-3-hdr", "name": "S01E03-2160p-HDR.mkv", "resType": 1})
 
     result = select_files(files, episode_keys=["S01E03"], season=1)
 
     assert result.matched_unique_file_count == 2
-    assert result.selected_file_ids == []
-    assert result.decision == "FILE_SELECTION_REVIEW"
-    with pytest.raises(FileSelectionError) as excinfo:
-        assert_selection_scope(result)
-    assert excinfo.value.code == "FILE_SELECTION_REVIEW"
+    assert result.selected_file_ids == ["file-3-hdr"]
+    assert result.selected_episode_keys == ["S01E03"]
+    assert result.decision == "PREFERRED_SINGLE_EPISODE"
+    assert_selection_scope(result)
 
 
 def test_explicit_whole_share_selects_all_unique_videos():

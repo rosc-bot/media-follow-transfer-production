@@ -160,8 +160,8 @@ def test_success_card_separates_verified_cumulative_progress_from_this_task():
         (False, True, True, True, False, True, False, AUTO_SAFE, "MISSING_EPISODES_CONFIRMED_BY_VERIFIED_CLOUD", ("collected",)),
         (False, False, True, True, False, True, False, AUTO_SAFE, "MISSING_EPISODES_CONFIRMED_BY_VERIFIED_CLOUD", ("collected", "inventory")),
         (False, False, False, True, False, True, False, AUTO_SAFE, "MISSING_EPISODES_CONFIRMED_BY_VERIFIED_CLOUD", ()),
-        (True, False, False, True, False, True, False, NEEDS_REVIEW, "LEDGER_CONFLICT:S01E01", ()),
-        (False, True, False, True, False, True, False, NEEDS_REVIEW, "LEDGER_CONFLICT:S01E01", ()),
+        (True, False, False, True, False, True, False, AUTO_SAFE, "MISSING_EPISODES_CONFIRMED_BY_VERIFIED_CLOUD", ()),
+        (False, True, False, True, False, True, False, AUTO_SAFE, "MISSING_EPISODES_CONFIRMED_BY_VERIFIED_CLOUD", ()),
         (False, False, False, False, False, True, False, NEEDS_REVIEW, "CLOUD_UNVERIFIED", ()),
         (False, False, False, True, True, True, False, NEEDS_REVIEW, "CLOUD_UNVERIFIED", ()),
         (False, False, False, True, False, False, False, NEEDS_REVIEW, "CLOUD_UNVERIFIED", ()),
@@ -191,7 +191,7 @@ def test_presence_planner_uses_verified_cloud_as_physical_truth(
         assert plan.presence_decisions["S01E01"]["classification"] == "PRESENT_CONFIRMED"
         assert plan.metadata_reconcile.get("S01E01", ()) == reconcile
         assert "S01E01" not in plan.missing_episode_keys
-    if not cloud and verified and not truncated and pagination_complete and not collected and not inventory and not completed:
+    if not cloud and verified and not truncated and pagination_complete and not completed:
         assert plan.presence_decisions["S01E01"]["classification"] == "MISSING_CONFIRMED"
         assert "S01E01" in plan.missing_episode_keys
 
@@ -202,7 +202,11 @@ async def test_multi_episode_success_sends_one_notification_message():
 
     from app.transfer.notifier import TransferNotifier
 
-    notifier = TransferNotifier(bot_token="123456:TEST_TOKEN", success_chat="@guangyazhauncun")
+    notifier = TransferNotifier(
+        bot_token="123456:TEST_TOKEN",
+        success_chat="@guangyazhauncun",
+        publish_chat="@guangyaziyuanfenxiang",
+    )
     response = __import__("httpx").Response(
         200,
         json={"ok": True, "result": {"message_id": 1}},
@@ -222,7 +226,17 @@ async def test_multi_episode_success_sends_one_notification_message():
         )
 
     assert result.sent is True
-    assert send.call_count == 1
+    assert result.target_chat_id == "@guangyazhauncun"
+    assert result.target_source == "transfer_success_chat"
+    # One batch card per configured destination, never one message per episode.
+    assert send.await_count == 2
+    assert [call.kwargs["json"]["chat_id"] for call in send.await_args_list] == [
+        "@guangyazhauncun", "@guangyaziyuanfenxiang",
+    ]
+    assert all(call.args[0].endswith("/sendMessage") for call in send.await_args_list)
+    primary_text = send.await_args_list[0].kwargs["json"]["text"]
+    assert "S01E08-E12（5集）" in primary_text
+    assert "本次已核验 5 个文件" in primary_text
 
 
 @pytest.mark.asyncio

@@ -65,11 +65,19 @@ class LegacyRootDiscoveryService:
                 folders = list(l1)
                 # Recursively descend into category folders (e.g. 电视剧, 动漫, 国产剧, 欧美剧, etc.)
                 for it1 in l1:
-                    if it1.get("resType") == 2 and not str(it1.get("name") or it1.get("fileName") or "").startswith("."):
+                    if (
+                        it1.get("resType") == 2
+                        and not str(it1.get("name") or it1.get("fileName") or "").startswith(".")
+                        and not re.search(r'\{tmdbid-\d+\}', str(it1.get("name") or it1.get("fileName") or ""), re.IGNORECASE)
+                    ):
                         l2 = await self.list_directories(provider=provider, auth_token=auth_token, parent_id=str(it1.get("fileId") or it1.get("id")))
                         folders.extend(l2)
                         for it2 in l2:
-                            if it2.get("resType") == 2 and not str(it2.get("name") or it2.get("fileName") or "").startswith("."):
+                            if (
+                                it2.get("resType") == 2
+                                and not str(it2.get("name") or it2.get("fileName") or "").startswith(".")
+                                and not re.search(r'\{tmdbid-\d+\}', str(it2.get("name") or it2.get("fileName") or ""), re.IGNORECASE)
+                            ):
                                 l3 = await self.list_directories(provider=provider, auth_token=auth_token, parent_id=str(it2.get("fileId") or it2.get("id")))
                                 folders.extend(l3)
             except GuangyaTransferError as auth_exc:

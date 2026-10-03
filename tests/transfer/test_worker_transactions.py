@@ -110,7 +110,7 @@ async def test_worker_classifies_remote_errors_by_category(sessions):
     async with sessions() as db, db.begin():
         db.add_all([BotSettings(key='global_pause', val='0'), BotSettings(key='transfer_paused', val='0')])
         first = await TransferQueueService.enqueue(
-            db, resource_id=9, provider='dry-run', episode_keys=['S01E01'], payload={'expected_files': ['a.mkv']},
+            db, resource_id=9, provider='dry-run', episode_keys=['S01E01'], payload={'expected_files': ['a.mkv']}, priority=90,
         )
         second = await TransferQueueService.enqueue(
             db, resource_id=10, provider='dry-run', episode_keys=['S01E02'], payload={'expected_files': ['b.mkv']},
@@ -168,6 +168,37 @@ async def test_transfer_paused_means_zero_orchestrator_invocations(sessions):
     async with sessions() as db:
         task = await db.scalar(select(TransferQueueTask))
         assert task.status == TransferStatus.QUEUED  # untouched
+        assert task.attempt_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('category, expected_status', [
+    (TransferErrorCategory.UNKNOWN, TransferStatus.RETRY_WAIT),
+    (TransferErrorCategory.INSUFFICIENT_SPACE, TransferStatus.FAILED),
+])
+async def test_unknown_backoff_and_space_terminal_policy_do_not_pause_queue(sessions, category, expected_status):
+    from app.transfer.errors import GuangyaTransferError
+
+    async with sessions() as db, db.begin():
+        db.add_all([BotSettings(key='global_pause', val='0'), BotSettings(key='transfer_paused', val='0')])
+        task = await TransferQueueService.enqueue(db, resource_id=951, provider='dry-run', payload={})
+
+    class ErrorAdapter:
+        async def transfer(self, payload):
+            raise GuangyaTransferError(category, 'recorded remote business failure')
+
+    worker = TransferQueueWorker(sessions, TransferOrchestrator({'dry-run': ErrorAdapter()}), worker_id='policy-test')
+    assert await worker.process_once() is True
+    assert await worker.process_once() is False  # No immediate retry or permanent-error replay.
+    async with sessions() as db:
+        persisted = await db.get(TransferQueueTask, task.id)
+        assert persisted.status == expected_status
+        assert persisted.attempt_count == 1
+        assert persisted.max_retries == 5
+        assert persisted.locked_at is None and persisted.locked_by is None
+        assert f'[{category}]' in persisted.error_message
+        assert (await db.get(BotSettings, 'transfer_paused')).val == '0'
+
 
 
 @pytest.mark.asyncio
@@ -256,7 +287,7 @@ async def test_verified_batch_records_each_episode_in_inventory_collected_and_re
 
 
 @pytest.mark.asyncio
-async def test_invalid_batch_episode_readback_pauses_before_completion(sessions):
+async def test_invalid_batch_episode_readback_holds_only_the_unsafe_task(sessions):
     file_e02 = "作品 {tmdbid-7}.S01E02.1080p.WEB-DL.mkv"
     file_e03 = "作品 {tmdbid-7}.S01E03.1080p.WEB-DL.mkv"
     async with sessions() as db, db.begin():
@@ -302,14 +333,17 @@ async def test_invalid_batch_episode_readback_pauses_before_completion(sessions)
         final_task = await db.get(TransferQueueTask, task.id)
         pause = await db.get(BotSettings, 'transfer_paused')
         inventory_count = await db.scalar(select(func.count(CloudDiskInventory.id)))
-        assert final_task.status == TransferStatus.RETRY_WAIT
+        assert final_task.status == 'PENDING'
         assert final_task.result['integrity_error'] == 'VERIFIED_EPISODE_MAP_INCOMPLETE'
-        assert pause.val == '1'
+        assert final_task.payload['preflight_classification'] == 'NEEDS_REVIEW'
+        assert final_task.payload['execution_stage'] == 'RENAME_VERIFIED'
+        assert final_task.locked_at is None and final_task.locked_by is None
+        assert pause.val == '0'  # Isolate this task, never stop unrelated transfers.
         assert inventory_count == 0
 
 
 @pytest.mark.asyncio
-async def test_scope_violation_failure_pauses_and_holds_task_for_review(sessions):
+async def test_scope_violation_failure_holds_task_without_global_pause(sessions):
     from app.transfer.errors import GuangyaTransferError
 
     async with sessions() as db, db.begin():
@@ -345,4 +379,5 @@ async def test_scope_violation_failure_pauses_and_holds_task_for_review(sessions
         assert final_task.status == 'PENDING'
         assert final_task.payload['scope_integrity_hold'] is True
         assert final_task.payload['preflight_classification'] == 'NEEDS_REVIEW'
-        assert pause.val == '1'
+        assert final_task.locked_at is None and final_task.locked_by is None
+        assert pause.val == '0'

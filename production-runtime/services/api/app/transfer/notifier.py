@@ -428,9 +428,6 @@ def build_promotion_card(*, task_payload: dict[str, Any], promotion_result: dict
 
 
 
-def fetch_tmdb_presentation_meta(payload: dict[str, Any]):
-    pass
-
 async def fetch_tmdb_presentation_meta(payload: dict[str, Any]) -> dict[str, Any]:
     """Fetch rich display metadata (cast, first_air_date, vote_average, overview) from TMDB."""
     tmdb_id = payload.get("tmdb_id")
@@ -961,10 +958,13 @@ class TransferNotifier:
                 if pub_card.poster_url:
                     pub_res = await self._send_telegram_photo_result(publish_target, pub_card.poster_url, pub_card.caption)
                     if not pub_res.sent:
-                        await self._send_telegram_result(publish_target, pub_card.caption)
+                        pub_res = await self._send_telegram_result(publish_target, pub_card.caption)
                 else:
-                    await self._send_telegram_result(publish_target, pub_card.caption)
-                logger.info("Successfully published resource card to %s", publish_target.chat_id)
+                    pub_res = await self._send_telegram_result(publish_target, pub_card.caption)
+                if pub_res.sent:
+                    logger.info("Successfully published resource card to %s", publish_target.chat_id)
+                else:
+                    logger.warning("Resource card publication failed to %s: %s", publish_target.chat_id, pub_res.error)
             except Exception as pub_exc:
                 logger.warning("Failed to publish resource card to %s: %s", publish_target.chat_id, pub_exc)
 

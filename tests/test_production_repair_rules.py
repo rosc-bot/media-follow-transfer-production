@@ -104,7 +104,7 @@ def test_missing_episode_selection_selects_only_exact_requested_episode_map():
     assert_selection_scope(result)
 
 
-def test_missing_episode_selection_rejects_unresolved_or_multi_match_episodes():
+def test_missing_episode_selection_prefers_highest_quality_per_episode():
     duplicate = _batch_files() + [
         {"fileId": "e03-alt", "name": "Show.S01E03.2160p.mkv", "resType": 1},
     ]
@@ -115,10 +115,11 @@ def test_missing_episode_selection_rejects_unresolved_or_multi_match_episodes():
         season=1,
     )
 
-    assert result.decision == "FILE_SELECTION_REVIEW"
-    assert result.selected_file_ids == []
-    with pytest.raises(FileSelectionError):
-        assert_selection_scope(result)
+    assert result.decision == "MISSING_EPISODES"
+    assert result.selected_file_ids == ["e01", "e03-alt"]
+    assert result.selected_episode_keys == ["S01E01", "S01E03"]
+    assert result.episode_file_map == {"S01E01": "e01", "S01E03": "e03-alt"}
+    assert_selection_scope(result)
 
 
 def test_missing_episode_selection_refuses_partial_episode_coverage():
@@ -171,6 +172,9 @@ async def _prepare_series(adapter):
                 "media_category": "日番",
                 "media_type": "tv",
                 "tmdb_id": 223564,
+                "ongoing_root_id": "root",
+                "completed_root_id": "completed-root",
+                "destination_kind": "ongoing",
             },
             root_id="root",
             ctx=context_from_auth_ref("access-token"),
@@ -196,8 +200,9 @@ async def test_multiple_directories_with_same_tmdb_identity_fail_closed():
         {"fileId": "series-b", "name": "Title B (2023) 4K {tmdbid-223564}", "resType": 2},
     ])
 
-    with pytest.raises(RuntimeError, match="DUPLICATE_TMDB_ROOT"):
+    with pytest.raises(FileSelectionError) as excinfo:
         await _prepare_series(adapter)
+    assert excinfo.value.code == "DUPLICATE_TMDB_ROOT"
     assert not any(url.endswith("/file/create_dir") for url, _ in adapter.calls)
 
 
@@ -425,7 +430,7 @@ async def test_physical_scan_uses_paginated_readback_without_trusting_sticky_has
             self.calls.append((url, dict(payload)))
             page = int(payload.get("page") or 0)
             items = self.files if page == 0 else []
-            return {"code": 0, "data": {"list": items, "hasMore": True}}
+            return {"code": 0, "data": {"list": items, "hasMore": True, "total": len(self.files)}}
 
     adapter = StickyHasMoreAdapter()
     scan = await adapter.scan_series_root_readonly(

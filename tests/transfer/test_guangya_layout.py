@@ -34,6 +34,7 @@ class LayoutGuangyaAdapter(GuangyaAdapter):
             return {'code': 0, 'data': {'fileId': file_id}}
         if url.endswith('/file/move_file'):
             assert payload == {'fileIds': ['legacy-series'], 'parentId': 'completed-root'}
+            self.children['ongoing-root'] = [item for item in self.children['ongoing-root'] if item['fileId'] != 'legacy-series']
             self.children['completed-root'].append({'fileId': 'legacy-series', 'name': '旧剧集 (2025) {tmdbid-1}', 'resType': 2})
             return {'code': 0, 'data': {}}
         if url.endswith('/file/rename'):
@@ -61,6 +62,9 @@ async def test_transfer_creates_series_and_season_directories_under_ongoing_root
         'series_folder_name': '新剧集 (2025) {tmdbid-1}',
         'season_folder_name': 'S01',
         'destination_kind': 'ongoing',
+        'tmdb_id': 1,
+        'ongoing_root_id': 'ongoing-root',
+        'completed_root_id': 'completed-root',
         'verify_attempts': 1,
     })
 
@@ -72,34 +76,33 @@ async def test_transfer_creates_series_and_season_directories_under_ongoing_root
 
 
 @pytest.mark.asyncio
-async def test_completed_transfer_promotes_existing_ongoing_series_before_restoring_final_episode():
+async def test_completed_transfer_rejects_implicit_promotion_without_restoring_final_episode():
     adapter = LayoutGuangyaAdapter()
 
-    outcome = await adapter.transfer({
-        'share_url': 'https://pan.guangyapan.com/s/share',
-        'target_folder_id': 'completed-root',
-        'auth_token': 'access-token',
-        'expected_files': ['S01E02.mkv'],
-        'series_folder_name': '旧剧集 (2025) {tmdbid-1}',
-        'season_folder_name': 'S01',
-        'destination_kind': 'completed',
-        'promotion_source_series_folder_id': 'legacy-series',
-        'verify_attempts': 1,
-    })
-
-    assert outcome.success is True
-    assert outcome.remote_series_folder_id == 'legacy-series'
-    assert outcome.remote_folder_id == 'legacy-s01'
-    assert any(url.endswith('/file/move_file') for url, _ in adapter.calls)
-    assert any(url.endswith('/file/rename') for url, _ in adapter.calls)
+    with pytest.raises(RuntimeError, match='PROMOTION_OPERATION_REQUIRED'):
+        await adapter.transfer({
+            'share_url': 'https://pan.guangyapan.com/s/share',
+            'target_folder_id': 'completed-root',
+            'auth_token': 'access-token',
+            'expected_files': ['S01E02.mkv'],
+            'series_folder_name': '旧剧集 (2025) {tmdbid-1}',
+            'season_folder_name': 'S01',
+            'destination_kind': 'completed',
+            'promotion_source_series_folder_id': 'legacy-series',
+            'verify_attempts': 1,
+        })
+    assert not any(url.endswith(('/file/move_file', '/restore_share', '/file/rename')) for url, _ in adapter.calls)
 
 
 @pytest.mark.asyncio
 async def test_promotion_only_moves_and_renames_without_restoring_a_share_again():
     adapter = LayoutGuangyaAdapter()
+    adapter.children['ongoing-root'] = [{'fileId': 'legacy-series', 'name': '旧剧集 (2025) {tmdbid-1}', 'resType': 2}]
 
     outcome = await adapter.transfer({
         'operation': 'promote',
+        'tmdb_id': 1,
+        'completed_root_id': 'completed-root',
         'target_folder_id': 'completed-root',
         'auth_token': 'access-token',
         'series_folder_name': '旧剧集 (2025) {tmdbid-1}',

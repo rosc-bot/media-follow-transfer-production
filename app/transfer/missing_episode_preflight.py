@@ -154,8 +154,8 @@ def plan_missing_episode_transfer(
                 tuple(share_keys),
                 presence_decisions=presence_decisions,
             )
-        if collected_present or inventory_present:
-            # 云盘实盘扫描没有此文件，哪怕账本记录过，也说明实盘缺集需要补齐！绝不卡死在 NEEDS_REVIEW
+        if (collected_present or inventory_present) and key not in active:
+            # 完整实盘扫描确认缺集可补齐，但旧账本绝不能绕过正在执行的同集任务。
             presence_decisions[key] = {
                 "classification": "MISSING_CONFIRMED",
                 "cloud_present": False,

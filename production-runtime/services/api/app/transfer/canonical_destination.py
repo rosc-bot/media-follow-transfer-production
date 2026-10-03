@@ -116,17 +116,19 @@ def _keywords(metadata: Mapping[str, Any]) -> frozenset[str]:
     return frozenset(values)
 
 
-def _countries(metadata: Mapping[str, Any]) -> frozenset[str]:
-    values: set[str] = set()
+def _countries(metadata: Mapping[str, Any]) -> tuple[str, ...]:
+    # Preserve TMDB's primary-country order. A minority coproducer must not
+    # override the first country merely because its region has priority.
+    values: list[str] = []
     sources = [metadata.get("origin_country"), metadata.get("production_countries")]
     for source in sources:
         for raw in _list_values(source):
             if isinstance(raw, Mapping):
                 raw = raw.get("iso_3166_1") or raw.get("country_code") or raw.get("code")
             value = _text(raw).upper()
-            if value:
-                values.add(value)
-    return frozenset(values)
+            if value and value not in values:
+                values.append(value)
+    return tuple(values)
 
 
 def _language(metadata: Mapping[str, Any]) -> str:
@@ -138,12 +140,13 @@ def _contains(names: tuple[str, ...], *needles: str) -> bool:
     return any(needle.casefold() in haystack for needle in needles)
 
 
-def _country_class(countries: frozenset[str]) -> str | None:
-    if countries & _CN_COUNTRIES:
+def _country_class(countries: tuple[str, ...]) -> str | None:
+    primary = frozenset(countries[:1])
+    if primary & _CN_COUNTRIES:
         return "cn"
-    if countries & _JP_KR_COUNTRIES:
+    if primary & _JP_KR_COUNTRIES:
         return "jpkr"
-    if countries & _WESTERN_COUNTRIES:
+    if primary & _WESTERN_COUNTRIES:
         return "western"
     return None
 

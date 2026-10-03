@@ -63,6 +63,8 @@ async def test_pending_review_row_is_not_reported_as_reused_active_transfer(tmp_
         assert result.reused is False
         assert result.deduplicated is False
         assert result.task.status == "PENDING"
+        assert result.task.attempt_count == 0
+        assert result.task.locked_at is None and result.task.locked_by is None
     await engine.dispose()
 
 
@@ -144,4 +146,59 @@ async def test_worker_hydrates_missing_fields_from_resource_and_cloud_config(tmp
     assert recorded_payload['expected_files'] == ['S01E01.mkv']
     assert recorded_payload['title'] == '测试剧'
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['QUEUED', 'RETRY_WAIT'])
+@pytest.mark.parametrize('classification', ['NEEDS_REVIEW', 'REJECTED'])
+async def test_claim_skips_review_fences_and_keeps_valid_work_available(tmp_path, status, classification):
+    engine = create_async_engine(f'sqlite+aiosqlite:///{tmp_path}/fences.db')
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as db, db.begin():
+            good = await TransferQueueService.enqueue(db, resource_id=901, provider='dry-run', payload={})
+            held = await TransferQueueService.enqueue(
+                db, resource_id=902, provider='dry-run',
+                payload={'preflight_classification': classification},
+            )
+            held.status = status
+            claimed = await TransferQueueService.claim_next(db, worker_id='fence-test')
+            assert claimed.id == good.id
+            assert held.status == status
+            assert held.attempt_count == 0
+            assert held.locked_by is None and held.locked_at is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('key', ['global_pause', 'follow_paused', 'transfer_paused'])
+async def test_pause_reads_observe_external_commits_with_retained_identity(tmp_path, key):
+    from app.follow.bot_settings_service import BotSettingsService
+
+    engine = create_async_engine(f'sqlite+aiosqlite:///{tmp_path}/pause-refresh.db')
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as db, db.begin():
+            db.add_all([BotSettings(key='global_pause', val='0'),
+                        BotSettings(key='follow_paused', val='0'),
+                        BotSettings(key='transfer_paused', val='0')])
+        async with sessions() as reader:
+            retained = await reader.get(BotSettings, key)
+            assert await BotSettingsService.get(reader, key) == '0'
+            await reader.commit()
+            async with sessions() as writer, writer.begin():
+                await BotSettingsService.set(writer, key, '1')
+            assert retained.val == '0'  # Deliberately retain an unexpired ORM identity.
+            assert await BotSettingsService.get(reader, key) == '1'
+            assert await BotSettingsService.is_transfer_paused(reader) is (key != 'follow_paused')
+            assert await BotSettingsService.is_follow_paused(reader) is (key != 'transfer_paused')
+            await BotSettingsService.set(reader, key, '0')
+            assert await BotSettingsService.get(reader, key) == '0'
+    finally:
+        await engine.dispose()
 
