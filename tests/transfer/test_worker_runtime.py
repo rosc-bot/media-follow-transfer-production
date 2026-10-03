@@ -59,7 +59,8 @@ async def test_transfer_runtime_recovers_process_errors_and_propagates_cancel(mo
 
 
 @pytest.mark.asyncio
-async def test_default_runtime_honors_interval_and_cleans_all_background_tasks(monkeypatch):
+@pytest.mark.parametrize('configured,expected', [(None, 3.0), (11, 11)])
+async def test_default_runtime_honors_interval_and_cleans_all_background_tasks(monkeypatch, configured, expected):
     started = []
     stopped = []
     heartbeats = []
@@ -87,7 +88,7 @@ async def test_default_runtime_honors_interval_and_cleans_all_background_tasks(m
     monkeypatch.setattr(runtime, 'recover_stale_tasks', recover)
     monkeypatch.setattr(runtime, '_transfer_worker_heartbeat_loop', heartbeat)
     monkeypatch.setattr(runtime, '_run_worker_slot', slot)
-    task = asyncio.create_task(runtime.run_transfer_worker(poll_interval_seconds=11))
+    task = asyncio.create_task(runtime.run_transfer_worker() if configured is None else runtime.run_transfer_worker(poll_interval_seconds=configured))
     try:
         await asyncio.wait_for(heartbeat_ready.wait(), timeout=1)
         await asyncio.wait_for(slots_ready.wait(), timeout=1)
@@ -96,7 +97,7 @@ async def test_default_runtime_honors_interval_and_cleans_all_background_tasks(m
         with pytest.raises(asyncio.CancelledError):
             await task
     recover.assert_awaited_once()
-    assert started == [(1, 11), (2, 11), (3, 11)]
+    assert started == [(1, expected), (2, expected), (3, expected)]
     assert set(stopped) == {'heartbeat', 1, 2, 3}
     assert heartbeats[0].is_set()
 

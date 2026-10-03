@@ -103,14 +103,17 @@ async def _run_worker_slot(
 async def run_transfer_worker(
     *,
     worker: QueueProcessor | None = None,
-    poll_interval_seconds: float = 5,
+    poll_interval_seconds: float | None = None,
     sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
 ) -> None:
     """Continuously consume the durable queue; default startup also recovers stale locks."""
     configure_logging()
+    # Preserve the live three-slot default (3s) and the injected legacy
+    # runner default (5s); explicit caller intervals are still honored.
+    effective_interval = (5.0 if worker is not None else 3.0) if poll_interval_seconds is None else poll_interval_seconds
     if worker is not None:
         # Injected workers are self-contained: no real DB, heartbeat, or extra slots.
-        await _poll_worker(worker, poll_interval_seconds=poll_interval_seconds, sleep=sleep, busy_delay=0)
+        await _poll_worker(worker, poll_interval_seconds=effective_interval, sleep=sleep, busy_delay=0)
         return
     logger.info("Transfer worker starting up (3-Worker Concurrency Enabled)...")
     heartbeat_stop = asyncio.Event()
@@ -120,7 +123,7 @@ async def run_transfer_worker(
         recovered = await recover_stale_tasks()
         logger.info("Recovered %d stale transfer tasks", recovered)
         slot_tasks = [
-            asyncio.create_task(_run_worker_slot(slot_id, poll_interval_seconds=poll_interval_seconds, sleep=sleep))
+            asyncio.create_task(_run_worker_slot(slot_id, poll_interval_seconds=effective_interval, sleep=sleep))
             for slot_id in (1, 2, 3)
         ]
         await asyncio.gather(*slot_tasks)
